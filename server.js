@@ -43,7 +43,7 @@ async function generateQuiz({ language, sourceText, options }) {
   } = options || {};
 
   const systemPrompt =
-    "You return ONLY valid JSON. No markdown. No extra text. " +
+    "You must output ONLY valid JSON that matches the provided JSON schema. " +
     "All questions, answers, and explanations must be strictly in the requested language.";
 
   const userPrompt = `
@@ -52,19 +52,81 @@ NUMBER_OF_QUESTIONS: ${numberOfQuestions}
 DIFFICULTY: ${difficulty}
 QUESTION_TYPES: ${Array.isArray(questionTypes) ? questionTypes.join(",") : questionTypes}
 
-Return JSON exactly in this format:
-{
-  "title": "string",
-  "questions": [
-    {
-      "type": "mcq|true_false|short",
-      "question": "string",
-      "choices": ["string","string","string","string"], 
-      "answer": "string",
-      "explanation": "string"
-    }
-  ]
+Use ONLY the source text. Do not invent outside facts.
+
+SOURCE TEXT:
+<<<
+${sourceText}
+>>>
+`;
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "quiz",
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["title", "questions"],
+            properties: {
+              title: { type: "string" },
+              questions: {
+                type: "array",
+                minItems: 1,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["type", "question", "answer", "explanation"],
+                  properties: {
+                    type: { type: "string", enum: ["mcq", "true_false", "short"] },
+                    question: { type: "string" },
+                    choices: {
+                      type: "array",
+                      items: { type: "string" },
+                      minItems: 2
+                    },
+                    answer: { type: "string" },
+                    explanation: { type: "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }),
+  });
+
+  if (!response.ok) {
+    const t = await response.text();
+    throw new Error(`OpenAI error ${response.status}: ${t}`);
+  }
+
+  const data = await response.json();
+  const outText =
+    data.output_text ||
+    (data.output?.[0]?.content?.[0]?.text ?? "");
+
+  if (!outText || !String(outText).trim()) {
+    throw new Error("OpenAI returned empty output text.");
+  }
+
+  return JSON.parse(outText);
 }
+
 
 SOURCE TEXT:
 <<<
