@@ -7,7 +7,7 @@ const Tesseract = require("tesseract.js");
 
 const app = express();
 
-// ============ CONFIG ============
+// ------------------- CONFIG -------------------
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json({ limit: "1mb" }));
@@ -22,19 +22,30 @@ function normalizeLanguage(lang) {
   return v ? v : "en";
 }
 
-function chunkText(text, size = 6000) {
+function safeNumber(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function chunkText(text, chunkSize = 6000) {
   const chunks = [];
-  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
+  for (let i = 0; i < text.length; i += chunkSize) chunks.push(text.slice(i, i + chunkSize));
   return chunks;
 }
 
-// ============ OPENAI HELPERS ============
+// ------------------- OPENAI (Responses API) -------------------
 function extractAnyTextFromResponsesApi(data) {
   if (!data) return "";
-  if (typeof data.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
 
+  // Most convenient, sometimes present
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  // Scan output items for content text
   const out = Array.isArray(data.output) ? data.output : [];
   const texts = [];
+
   for (const item of out) {
     const content = Array.isArray(item.content) ? item.content : [];
     for (const c of content) {
@@ -42,10 +53,11 @@ function extractAnyTextFromResponsesApi(data) {
       if (typeof c?.output_text === "string" && c.output_text.trim()) texts.push(c.output_text.trim());
     }
   }
+
   return texts.join("\n").trim();
 }
 
-async function openaiCall({ model, input, schema }) {
+async function openaiCall({ input, schema }) {
   needEnv("OPENAI_API_KEY");
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -55,7 +67,7 @@ async function openaiCall({ model, input, schema }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model,
+      model: "gpt-4o-mini",
       temperature: 0,
       max_output_tokens: 2500,
       input,
@@ -70,34 +82,41 @@ async function openaiCall({ model, input, schema }) {
     }),
   });
 
-  const raw = await resp.text();
+  const rawBody = await resp.text();
 
   if (!resp.ok) {
-    throw new Error(`OpenAI error ${resp.status}: ${raw.slice(0, 800)}`);
+    throw new Error(`OpenAI error ${resp.status}: ${rawBody.slice(0, 1200)}`);
   }
 
   let data;
   try {
-    data = JSON.parse(raw);
+    data = JSON.parse(rawBody);
   } catch {
-    throw new Error(`OpenAI returned non-JSON body: ${raw.slice(0, 800)}`);
+    throw new Error(`OpenAI returned non-JSON body: ${rawBody.slice(0, 1200)}`);
   }
 
   const outText = extractAnyTextFromResponsesApi(data);
-  if (!outText) throw new Error("OpenAI response had no extractable text.");
+  if (!outText) {
+    throw new Error("OpenAI response had no extractable text (output_text/content empty).");
+  }
 
   return outText;
 }
 
 async function generateQuiz({ language, sourceText, options }) {
-  const { numberOfQuestions = 10, difficulty = "medium", questionTypes = ["mcq"] } = options || {};
+  // pentru stabilitate: MCQ only
+  const numberOfQuestions = safeNumber(options?.numberOfQuestions, 10);
+  const difficulty = options?.difficulty || "medium";
 
+  // Limităm textul trimis către AI (evită prompt prea mare)
   const MAX_SOURCE_CHARS = 18000;
   const trimmedSource =
     (sourceText || "").length > MAX_SOURCE_CHARS
       ? (sourceText || "").slice(0, MAX_SOURCE_CHARS) + "\n\n[NOTE: Source was truncated.]"
       : (sourceText || "");
 
+  // STRICT SCHEMA (MCQ ONLY)
+  // IMPORTANT: required include TOATE cheile din properties (in strict mode)
   const schema = {
     type: "object",
     additionalProperties: false,
@@ -110,11 +129,15 @@ async function generateQuiz({ language, sourceText, options }) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["type", "question", "answer", "explanation"],
+          required: ["type", "question", "choices", "answer", "explanation"],
           properties: {
-            type: { type: "string", enum: ["mcq", "true_false", "short"] },
+            type: { type: "string", enum: ["mcq"] },
             question: { type: "string" },
-            choices: { type: "array", items: { type: "string" }, minItems: 2 },
+            choices: {
+              type: "array",
+              items: { type: "string" },
+              minItems: 2,
+            },
             answer: { type: "string" },
             explanation: { type: "string" },
           },
@@ -133,7 +156,10 @@ async function generateQuiz({ language, sourceText, options }) {
 LANGUAGE: ${language}
 NUMBER_OF_QUESTIONS: ${numberOfQuestions}
 DIFFICULTY: ${difficulty}
-QUESTION_TYPES: ${Array.isArray(questionTypes) ? questionTypes.join(",") : String(questionTypes)}
+
+Generate multiple-choice questions ONLY.
+- Provide 4 choices for each question.
+- The 'answer' must match one of the choices exactly.
 
 Use ONLY the source text. Do not invent outside facts.
 
@@ -148,22 +174,23 @@ ${trimmedSource}
     { role: "user", content: userPrompt },
   ];
 
-  const out1 = await openaiCall({ model: "gpt-4o-mini", input, schema });
+  // First try
+  const out1 = await openaiCall({ input, schema });
 
   try {
     return JSON.parse(out1);
   } catch {
-    // repair once
+    // Repair once (rare)
     const repairInput = [
       { role: "system", content: "Return ONLY valid JSON matching the schema. No extra text." },
       { role: "user", content: `Fix into valid JSON only:\n\n${out1}` },
     ];
-    const out2 = await openaiCall({ model: "gpt-4o-mini", input: repairInput, schema });
+    const out2 = await openaiCall({ input: repairInput, schema });
     return JSON.parse(out2);
   }
 }
 
-// ============ UPLOAD ============
+// ------------------- UPLOAD -------------------
 const uploadPdf = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
@@ -174,7 +201,7 @@ const uploadImages = multer({
   limits: { fileSize: 5 * 1024 * 1024, files: 10 },
 });
 
-// ============ ROUTES ============
+// ------------------- ROUTES -------------------
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
@@ -184,24 +211,21 @@ app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
     if (file.mimetype !== "application/pdf") return res.status(400).json({ error: "File is not a PDF" });
 
     const language = normalizeLanguage(req.body.language);
-    const numberOfQuestions = Number(req.body.numberOfQuestions || 10);
+    const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
     const difficulty = req.body.difficulty || "medium";
-    const questionTypes = (req.body.questionTypes || "mcq")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
 
     const parsed = await pdfParse(file.buffer);
     const text = (parsed.text || "").trim();
     if (!text) return res.status(400).json({ error: "Could not extract text from PDF" });
 
+    // (opțional) chunking — aici doar reconstruim într-un singur text
     const chunks = chunkText(text, 6000);
     const sourceText = chunks.join("\n\n");
 
     const quiz = await generateQuiz({
       language,
       sourceText,
-      options: { numberOfQuestions, difficulty, questionTypes },
+      options: { numberOfQuestions, difficulty },
     });
 
     res.json(quiz);
@@ -218,8 +242,11 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
     let text = "";
     for (const f of files) {
       if (!["image/jpeg", "image/png", "image/webp"].includes(f.mimetype)) {
-        return res.status(400).json({ error: "Invalid image type" });
+        return res.status(400).json({ error: "Invalid image type (use jpg/png/webp)" });
       }
+
+      // OCR (eng default). Dacă vrei română, putem seta "ron", dar tesseract pe server
+      // are nevoie să existe limba instalată; pe Render de obicei nu e.
       const r = await Tesseract.recognize(f.buffer, "eng");
       text += "\n" + (r.data.text || "");
     }
@@ -228,17 +255,13 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
     if (!text) return res.status(400).json({ error: "OCR produced no text" });
 
     const language = normalizeLanguage(req.body.language);
-    const numberOfQuestions = Number(req.body.numberOfQuestions || 10);
+    const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
     const difficulty = req.body.difficulty || "medium";
-    const questionTypes = (req.body.questionTypes || "mcq")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
 
     const quiz = await generateQuiz({
       language,
       sourceText: text,
-      options: { numberOfQuestions, difficulty, questionTypes },
+      options: { numberOfQuestions, difficulty },
     });
 
     res.json(quiz);
@@ -247,7 +270,6 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
   }
 });
 
-// ============ START ============
+// ------------------- START -------------------
 const port = Number(process.env.PORT || 3001);
 app.listen(port, () => console.log("Quiz API running on port", port));
-
