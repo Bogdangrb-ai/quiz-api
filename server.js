@@ -33,52 +33,7 @@ function chunkText(text, size = 6000) {
 }
 
 // =================== OPENAI ===================
-async function generateQuiz({ language, sourceText, options }) {
-  needEnv("OPENAI_API_KEY");
-
-  const {
-    numberOfQuestions = 10,
-    difficulty = "medium",
-    questionTypes = ["mcq"],
-  } = options || {};
-
-  // 1) Limităm textul ca să nu explodeze promptul (FOARTE IMPORTANT)
-  const MAX_SOURCE_CHARS = 18000; // suficient pentru 8-10 pagini "normale"
-  const trimmedSource =
-    (sourceText || "").length > MAX_SOURCE_CHARS
-      ? (sourceText || "").slice(0, MAX_SOURCE_CHARS) +
-        "\n\n[NOTE: Source was truncated to fit limits.]"
-      : (sourceText || "");
-
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    required: ["title", "questions"],
-    properties: {
-      title: { type: "string" },
-      questions: {
-        type: "array",
-        minItems: 1,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["type", "question", "answer", "explanation"],
-          properties: {
-            type: { type: "string", enum: ["mcq", "true_false", "short"] },
-            question: { type: "string" },
-            // choices e optional (doar la mcq)
-            choices: {
-              type: "array",
-              items: { type: "string" },
-              minItems: 2
-            },
-            answer: { type: "string" },
-            explanation: { type: "string" }
-          }
-        }
-      }
-    }
-  };
+Eroare: HTTP 500. Răspuns: {"error":"Unexpected end of JSON input"}
 
   const systemPrompt =
     "Output ONLY valid JSON matching the provided JSON schema. " +
