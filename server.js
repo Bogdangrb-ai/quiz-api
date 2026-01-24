@@ -42,9 +42,49 @@ async function generateQuiz({ language, sourceText, options }) {
     questionTypes = ["mcq"],
   } = options || {};
 
+  // 1) Limităm textul ca să nu explodeze promptul (FOARTE IMPORTANT)
+  const MAX_SOURCE_CHARS = 18000; // suficient pentru 8-10 pagini "normale"
+  const trimmedSource =
+    (sourceText || "").length > MAX_SOURCE_CHARS
+      ? (sourceText || "").slice(0, MAX_SOURCE_CHARS) +
+        "\n\n[NOTE: Source was truncated to fit limits.]"
+      : (sourceText || "");
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["title", "questions"],
+    properties: {
+      title: { type: "string" },
+      questions: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["type", "question", "answer", "explanation"],
+          properties: {
+            type: { type: "string", enum: ["mcq", "true_false", "short"] },
+            question: { type: "string" },
+            // choices e optional (doar la mcq)
+            choices: {
+              type: "array",
+              items: { type: "string" },
+              minItems: 2
+            },
+            answer: { type: "string" },
+            explanation: { type: "string" }
+          }
+        }
+      }
+    }
+  };
+
   const systemPrompt =
-    "You must output ONLY valid JSON that matches the provided JSON schema. " +
-    "All questions, answers, and explanations must be strictly in the requested language.";
+    "Output ONLY valid JSON matching the provided JSON schema. " +
+    "No markdown, no extra text. " +
+    "All content must be strictly in the requested language. " +
+    "Keep explanations short (1-2 sentences).";
 
   const userPrompt = `
 LANGUAGE: ${language}
@@ -56,64 +96,74 @@ Use ONLY the source text. Do not invent outside facts.
 
 SOURCE TEXT:
 <<<
-${sourceText}
+${trimmedSource}
 >>>
 `;
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      input: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "quiz",
-          strict: true,
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            required: ["title", "questions"],
-            properties: {
-              title: { type: "string" },
-              questions: {
-                type: "array",
-                minItems: 1,
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  required: ["type", "question", "answer", "explanation"],
-                  properties: {
-                    type: { type: "string", enum: ["mcq", "true_false", "short"] },
-                    question: { type: "string" },
-                    choices: {
-                      type: "array",
-                      items: { type: "string" },
-                      minItems: 2
-                    },
-                    answer: { type: "string" },
-                    explanation: { type: "string" }
-                  }
-                }
-              }
-            }
+  async function callOnce(extraUserText) {
+    const input = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt + (extraUserText ? "\n\n" + extraUserText : "") },
+    ];
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0,
+        max_output_tokens: 2500, // 2) îi dăm spațiu să nu taie JSON-ul
+        input,
+        text: {
+          format: {
+            type: "json_schema",
+            name: "quiz",
+            strict: true,
+            schema
           }
         }
-      }
-    }),
-  });
+      }),
+    });
 
-  if (!response.ok) {
-    const t = await response.text();
-    throw new Error(`OpenAI error ${response.status}: ${t}`);
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`OpenAI error ${resp.status}: ${t}`);
+    }
+
+    const data = await resp.json();
+    const outText =
+      data.output_text ||
+      (data.output?.[0]?.content?.[0]?.text ?? "");
+
+    return String(outText || "");
   }
+
+  // Prima încercare
+  const out1 = await callOnce("");
+
+  if (!out1.trim()) {
+    throw new Error("OpenAI returned empty output text.");
+  }
+
+  try {
+    return JSON.parse(out1);
+  } catch (e) {
+    // 3) Repair automat dacă JSON-ul e incomplet/tăiat
+    const out2 = await callOnce(
+      "The previous output was invalid JSON. Return ONLY valid JSON matching the schema. " +
+      "Here is the invalid output to fix:\n\n" + out1
+    );
+
+    if (!out2.trim()) {
+      throw new Error("OpenAI returned empty output text on JSON repair.");
+    }
+
+    return JSON.parse(out2);
+  }
+}
 
   const data = await response.json();
   const outText =
