@@ -17,14 +17,6 @@ function needEnv(name) {
   if (!process.env[name]) throw new Error(`Missing environment variable: ${name}`);
 }
 
-function getSupabase() {
-  needEnv("SUPABASE_URL");
-  needEnv("SUPABASE_SERVICE_ROLE_KEY");
-  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false },
-  });
-}
-
 function normalizeLanguage(lang) {
   if (!lang || typeof lang !== "string") return "en";
   const v = lang.trim();
@@ -36,10 +28,27 @@ function safeNumber(v, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function chunkText(text, chunkSize = 6000) {
-  const chunks = [];
-  for (let i = 0; i < text.length; i += chunkSize) chunks.push(text.slice(i, i + chunkSize));
-  return chunks;
+function normalizeDifficulty(v) {
+  const s = String(v || "").toLowerCase().trim();
+  if (["easy", "usor", "ușor"].includes(s)) return "easy";
+  if (["hard", "greu"].includes(s)) return "hard";
+  return "medium";
+}
+
+// ------------------- SUPABASE -------------------
+needEnv("SUPABASE_URL");
+needEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false } }
+);
+
+// Guest user id helper (nu e autentificare, doar un id simplu)
+function normalizeUserId(v) {
+  const s = String(v || "").trim();
+  return s || ("ro_guest_" + Math.random().toString(36).slice(2, 10));
 }
 
 // ------------------- OPENAI (Responses API) -------------------
@@ -112,7 +121,7 @@ async function openaiCall({ input, schema }) {
 
 async function generateQuiz({ language, sourceText, options }) {
   const numberOfQuestions = safeNumber(options?.numberOfQuestions, 10);
-  const difficulty = options?.difficulty || "medium";
+  const difficulty = normalizeDifficulty(options?.difficulty || "medium");
 
   const MAX_SOURCE_CHARS = 18000;
   const trimmedSource =
@@ -137,7 +146,11 @@ async function generateQuiz({ language, sourceText, options }) {
           properties: {
             type: { type: "string", enum: ["mcq"] },
             question: { type: "string" },
-            choices: { type: "array", items: { type: "string" }, minItems: 4, maxItems: 4 },
+            choices: {
+              type: "array",
+              items: { type: "string" },
+              minItems: 2,
+            },
             answer: { type: "string" },
             explanation: { type: "string" },
           },
@@ -158,9 +171,10 @@ NUMBER_OF_QUESTIONS: ${numberOfQuestions}
 DIFFICULTY: ${difficulty}
 
 Generate multiple-choice questions ONLY.
-- Provide EXACTLY 4 choices for each question.
+- Provide exactly 4 choices for each question.
 - The 'answer' must match one of the choices exactly.
-- Use ONLY the source text. Do not invent outside facts.
+
+Use ONLY the source text. Do not invent outside facts.
 
 SOURCE TEXT:
 <<<
@@ -178,6 +192,7 @@ ${trimmedSource}
   try {
     return JSON.parse(out1);
   } catch {
+    // Repair once
     const repairInput = [
       { role: "system", content: "Return ONLY valid JSON matching the schema. No extra text." },
       { role: "user", content: `Fix into valid JSON only:\n\n${out1}` },
@@ -185,6 +200,45 @@ ${trimmedSource}
     const out2 = await openaiCall({ input: repairInput, schema });
     return JSON.parse(out2);
   }
+}
+
+// ------------------- DB SAVE HELPERS -------------------
+async function saveQuizToDb({ user_id, title, language, source_type, source_meta, settings, questions }) {
+  // 1) insert quiz
+  const { data: quizRow, error: qErr } = await supabase
+    .from("quizzes")
+    .insert([
+      {
+        user_id,
+        title,
+        language,
+        source_type,
+        source_meta: source_meta || {},
+        settings: settings || {},
+      },
+    ])
+    .select("id")
+    .single();
+
+  if (qErr) throw new Error(qErr.message);
+
+  const quiz_id = quizRow.id;
+
+  // 2) insert questions
+  const rows = (questions || []).map((q, idx) => ({
+    quiz_id,
+    position: idx + 1,
+    type: q.type || "mcq",
+    question: q.question || "",
+    choices: q.choices || [],
+    answer: q.answer || "",
+    explanation: q.explanation || "",
+  }));
+
+  const { error: qsErr } = await supabase.from("questions").insert(rows);
+  if (qsErr) throw new Error(qsErr.message);
+
+  return quiz_id;
 }
 
 // ------------------- UPLOAD -------------------
@@ -201,7 +255,54 @@ const uploadImages = multer({
 // ------------------- ROUTES -------------------
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// ---------- Generate from PDF ----------
+// LIST quizzes for a user
+app.get("/api/quizzes", async (req, res) => {
+  try {
+    const user_id = String(req.query.user_id || "").trim();
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    const { data, error } = await supabase
+      .from("quizzes")
+      .select("id,title,language,source_type,source_meta,settings,created_at")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) throw new Error(error.message);
+    res.json({ quizzes: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// GET one quiz + questions
+app.get("/api/quizzes/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const { data: quiz, error: qErr } = await supabase
+      .from("quizzes")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (qErr) throw new Error(qErr.message);
+
+    const { data: questions, error: qsErr } = await supabase
+      .from("questions")
+      .select("id,type,question,choices,answer,explanation,position")
+      .eq("quiz_id", id)
+      .order("position", { ascending: true });
+
+    if (qsErr) throw new Error(qsErr.message);
+
+    res.json({ quiz, questions: questions || [] });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// PDF -> generate -> save -> return
 app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -210,50 +311,13 @@ app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
 
     const language = normalizeLanguage(req.body.language);
     const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
-    const difficulty = req.body.difficulty || "medium";
+    const difficulty = normalizeDifficulty(req.body.difficulty || "medium");
+
+    const user_id = normalizeUserId(req.body.user_id);
 
     const parsed = await pdfParse(file.buffer);
     const text = (parsed.text || "").trim();
     if (!text) return res.status(400).json({ error: "Could not extract text from PDF" });
-
-    const chunks = chunkText(text, 6000);
-    const sourceText = chunks.join("\n\n");
-
-    const quiz = await generateQuiz({
-      language,
-      sourceText,
-      options: { numberOfQuestions, difficulty },
-    });
-
-    res.json(quiz);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// ---------- Generate from Images ----------
-app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) => {
-  try {
-    const files = req.files || [];
-    if (!files.length) return res.status(400).json({ error: "Missing images" });
-
-    let text = "";
-    for (const f of files) {
-      if (!["image/jpeg", "image/png", "image/webp"].includes(f.mimetype)) {
-        return res.status(400).json({ error: "Invalid image type (use jpg/png/webp)" });
-      }
-
-      // OCR (eng default)
-      const r = await Tesseract.recognize(f.buffer, "eng");
-      text += "\n" + (r.data.text || "");
-    }
-
-    text = text.trim();
-    if (!text) return res.status(400).json({ error: "OCR produced no text" });
-
-    const language = normalizeLanguage(req.body.language);
-    const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
-    const difficulty = req.body.difficulty || "medium";
 
     const quiz = await generateQuiz({
       language,
@@ -261,123 +325,72 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
       options: { numberOfQuestions, difficulty },
     });
 
-    res.json(quiz);
+    const quiz_id = await saveQuizToDb({
+      user_id,
+      title: quiz.title || "Quiz",
+      language,
+      source_type: "pdf",
+      source_meta: { filename: file.originalname, size: file.size },
+      settings: { numberOfQuestions, difficulty },
+      questions: quiz.questions || [],
+    });
+
+    res.json({ ...quiz, quiz_id });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
 
-// ------------------- SAVE QUIZ (Supabase) -------------------
-app.post("/api/quizzes/save", async (req, res) => {
+// Images -> OCR -> generate -> save -> return
+app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) => {
   try {
-    const supabase = getSupabase();
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: "Missing images" });
 
-    const user_id = String(req.body.user_id || "guest").trim();
-    const source_type = String(req.body.source_type || "pdf").trim(); // pdf | images | topic
-    const language = String(req.body.language || "ro").trim();
-    const settings = req.body.settings || {};
-    const source_meta = req.body.source_meta || {};
+    const language = normalizeLanguage(req.body.language);
+    const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
+    const difficulty = normalizeDifficulty(req.body.difficulty || "medium");
 
-    const quiz = req.body.quiz;
-    if (!quiz || !quiz.title || !Array.isArray(quiz.questions)) {
-      return res.status(400).json({ error: "Missing quiz payload (quiz.title/quiz.questions)" });
+    const user_id = normalizeUserId(req.body.user_id);
+
+    let text = "";
+    for (const f of files) {
+      if (!["image/jpeg", "image/png", "image/webp"].includes(f.mimetype)) {
+        return res.status(400).json({ error: "Invalid image type (use jpg/png/webp)" });
+      }
+
+      const r = await Tesseract.recognize(f.buffer, "eng");
+      text += "\n" + (r.data.text || "");
     }
 
-    // Insert quiz
-    const { data: quizRow, error: qErr } = await supabase
-      .from("quizzes")
-      .insert([
-        {
-          user_id,
-          title: quiz.title,
-          language,
-          source_type,
-          source_meta,
-          settings,
-        },
-      ])
-      .select()
-      .single();
+    text = text.trim();
+    if (!text) return res.status(400).json({ error: "OCR produced no text" });
 
-    if (qErr) throw new Error(qErr.message);
+    const quiz = await generateQuiz({
+      language,
+      sourceText: text,
+      options: { numberOfQuestions, difficulty },
+    });
 
-    // Insert questions
-    const rows = quiz.questions.map((q, idx) => ({
-      quiz_id: quizRow.id,
-      idx,
-      type: q.type || "mcq",
-      question: q.question || "",
-      choices: Array.isArray(q.choices) ? q.choices : [],
-      answer: q.answer || "",
-      explanation: q.explanation || "",
-      source_page: q.source_page ?? null,
-      source_snippet: q.source_snippet ?? null,
-      confidence: q.confidence ?? null,
-      image_url: q.image_url ?? null,
-    }));
+    const quiz_id = await saveQuizToDb({
+      user_id,
+      title: quiz.title || "Quiz",
+      language,
+      source_type: "images",
+      source_meta: { count: files.length },
+      settings: { numberOfQuestions, difficulty },
+      questions: quiz.questions || [],
+    });
 
-    const { error: qsErr } = await supabase.from("questions").insert(rows);
-    if (qsErr) throw new Error(qsErr.message);
-
-    res.json({ ok: true, quiz_id: quizRow.id });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// ------------------- LIST QUIZZES -------------------
-app.get("/api/quizzes", async (req, res) => {
-  try {
-    const supabase = getSupabase();
-    const user_id = String(req.query.user_id || "").trim();
-    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
-
-    const { data, error } = await supabase
-      .from("quizzes")
-      .select("id,title,language,source_type,created_at")
-      .eq("user_id", user_id)
-      .order("created_at", { ascending: false });
-
-    if (error) throw new Error(error.message);
-
-    res.json({ ok: true, quizzes: data || [] });
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// ------------------- GET ONE QUIZ + QUESTIONS -------------------
-app.get("/api/quizzes/:id", async (req, res) => {
-  try {
-    const supabase = getSupabase();
-    const user_id = String(req.query.user_id || "").trim();
-    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
-
-    const quiz_id = req.params.id;
-
-    const { data: quiz, error: qErr } = await supabase
-      .from("quizzes")
-      .select("*")
-      .eq("id", quiz_id)
-      .eq("user_id", user_id)
-      .single();
-
-    if (qErr) throw new Error(qErr.message);
-
-    const { data: questions, error: qsErr } = await supabase
-      .from("questions")
-      .select("*")
-      .eq("quiz_id", quiz_id)
-      .order("idx", { ascending: true });
-
-    if (qsErr) throw new Error(qsErr.message);
-
-    res.json({ ok: true, quiz: { ...quiz, questions: questions || [] } });
+    res.json({ ...quiz, quiz_id });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
 
 // ------------------- START -------------------
+const port = Number(process.env.PORT || 3001);
+app.listen(port, () => console.log("Quiz API running on port", port));
+
 const port = Number(process.env.PORT || 3001);
 app.listen(port, () => console.log("Quiz API running on port", port));
