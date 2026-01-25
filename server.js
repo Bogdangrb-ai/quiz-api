@@ -4,16 +4,25 @@ const cors = require("cors");
 const multer = require("multer");
 const pdfParse = require("pdf-parse");
 const Tesseract = require("tesseract.js");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
 // ------------------- CONFIG -------------------
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 function needEnv(name) {
   if (!process.env[name]) throw new Error(`Missing environment variable: ${name}`);
+}
+
+function getSupabase() {
+  needEnv("SUPABASE_URL");
+  needEnv("SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false },
+  });
 }
 
 function normalizeLanguage(lang) {
@@ -37,12 +46,10 @@ function chunkText(text, chunkSize = 6000) {
 function extractAnyTextFromResponsesApi(data) {
   if (!data) return "";
 
-  // Most convenient, sometimes present
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // Scan output items for content text
   const out = Array.isArray(data.output) ? data.output : [];
   const texts = [];
 
@@ -104,11 +111,9 @@ async function openaiCall({ input, schema }) {
 }
 
 async function generateQuiz({ language, sourceText, options }) {
-  // pentru stabilitate: MCQ only
   const numberOfQuestions = safeNumber(options?.numberOfQuestions, 10);
   const difficulty = options?.difficulty || "medium";
 
-  // Limităm textul trimis către AI (evită prompt prea mare)
   const MAX_SOURCE_CHARS = 18000;
   const trimmedSource =
     (sourceText || "").length > MAX_SOURCE_CHARS
@@ -116,7 +121,6 @@ async function generateQuiz({ language, sourceText, options }) {
       : (sourceText || "");
 
   // STRICT SCHEMA (MCQ ONLY)
-  // IMPORTANT: required include TOATE cheile din properties (in strict mode)
   const schema = {
     type: "object",
     additionalProperties: false,
@@ -133,11 +137,7 @@ async function generateQuiz({ language, sourceText, options }) {
           properties: {
             type: { type: "string", enum: ["mcq"] },
             question: { type: "string" },
-            choices: {
-              type: "array",
-              items: { type: "string" },
-              minItems: 2,
-            },
+            choices: { type: "array", items: { type: "string" }, minItems: 4, maxItems: 4 },
             answer: { type: "string" },
             explanation: { type: "string" },
           },
@@ -158,10 +158,9 @@ NUMBER_OF_QUESTIONS: ${numberOfQuestions}
 DIFFICULTY: ${difficulty}
 
 Generate multiple-choice questions ONLY.
-- Provide 4 choices for each question.
+- Provide EXACTLY 4 choices for each question.
 - The 'answer' must match one of the choices exactly.
-
-Use ONLY the source text. Do not invent outside facts.
+- Use ONLY the source text. Do not invent outside facts.
 
 SOURCE TEXT:
 <<<
@@ -174,13 +173,11 @@ ${trimmedSource}
     { role: "user", content: userPrompt },
   ];
 
-  // First try
   const out1 = await openaiCall({ input, schema });
 
   try {
     return JSON.parse(out1);
   } catch {
-    // Repair once (rare)
     const repairInput = [
       { role: "system", content: "Return ONLY valid JSON matching the schema. No extra text." },
       { role: "user", content: `Fix into valid JSON only:\n\n${out1}` },
@@ -204,6 +201,7 @@ const uploadImages = multer({
 // ------------------- ROUTES -------------------
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
+// ---------- Generate from PDF ----------
 app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -218,7 +216,6 @@ app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
     const text = (parsed.text || "").trim();
     if (!text) return res.status(400).json({ error: "Could not extract text from PDF" });
 
-    // (opțional) chunking — aici doar reconstruim într-un singur text
     const chunks = chunkText(text, 6000);
     const sourceText = chunks.join("\n\n");
 
@@ -234,6 +231,7 @@ app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
   }
 });
 
+// ---------- Generate from Images ----------
 app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) => {
   try {
     const files = req.files || [];
@@ -245,8 +243,7 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
         return res.status(400).json({ error: "Invalid image type (use jpg/png/webp)" });
       }
 
-      // OCR (eng default). Dacă vrei română, putem seta "ron", dar tesseract pe server
-      // are nevoie să existe limba instalată; pe Render de obicei nu e.
+      // OCR (eng default)
       const r = await Tesseract.recognize(f.buffer, "eng");
       text += "\n" + (r.data.text || "");
     }
@@ -265,6 +262,117 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
     });
 
     res.json(quiz);
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ------------------- SAVE QUIZ (Supabase) -------------------
+app.post("/api/quizzes/save", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+
+    const user_id = String(req.body.user_id || "guest").trim();
+    const source_type = String(req.body.source_type || "pdf").trim(); // pdf | images | topic
+    const language = String(req.body.language || "ro").trim();
+    const settings = req.body.settings || {};
+    const source_meta = req.body.source_meta || {};
+
+    const quiz = req.body.quiz;
+    if (!quiz || !quiz.title || !Array.isArray(quiz.questions)) {
+      return res.status(400).json({ error: "Missing quiz payload (quiz.title/quiz.questions)" });
+    }
+
+    // Insert quiz
+    const { data: quizRow, error: qErr } = await supabase
+      .from("quizzes")
+      .insert([
+        {
+          user_id,
+          title: quiz.title,
+          language,
+          source_type,
+          source_meta,
+          settings,
+        },
+      ])
+      .select()
+      .single();
+
+    if (qErr) throw new Error(qErr.message);
+
+    // Insert questions
+    const rows = quiz.questions.map((q, idx) => ({
+      quiz_id: quizRow.id,
+      idx,
+      type: q.type || "mcq",
+      question: q.question || "",
+      choices: Array.isArray(q.choices) ? q.choices : [],
+      answer: q.answer || "",
+      explanation: q.explanation || "",
+      source_page: q.source_page ?? null,
+      source_snippet: q.source_snippet ?? null,
+      confidence: q.confidence ?? null,
+      image_url: q.image_url ?? null,
+    }));
+
+    const { error: qsErr } = await supabase.from("questions").insert(rows);
+    if (qsErr) throw new Error(qsErr.message);
+
+    res.json({ ok: true, quiz_id: quizRow.id });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ------------------- LIST QUIZZES -------------------
+app.get("/api/quizzes", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    const user_id = String(req.query.user_id || "").trim();
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    const { data, error } = await supabase
+      .from("quizzes")
+      .select("id,title,language,source_type,created_at")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    res.json({ ok: true, quizzes: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ------------------- GET ONE QUIZ + QUESTIONS -------------------
+app.get("/api/quizzes/:id", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    const user_id = String(req.query.user_id || "").trim();
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    const quiz_id = req.params.id;
+
+    const { data: quiz, error: qErr } = await supabase
+      .from("quizzes")
+      .select("*")
+      .eq("id", quiz_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (qErr) throw new Error(qErr.message);
+
+    const { data: questions, error: qsErr } = await supabase
+      .from("questions")
+      .select("*")
+      .eq("quiz_id", quiz_id)
+      .order("idx", { ascending: true });
+
+    if (qsErr) throw new Error(qsErr.message);
+
+    res.json({ ok: true, quiz: { ...quiz, questions: questions || [] } });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
