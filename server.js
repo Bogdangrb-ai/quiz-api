@@ -274,6 +274,60 @@ app.get("/api/quizzes", async (req, res) => {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
+// === GET QUIZ (title + questions ordered by idx) ===
+app.get("/api/quiz/:id", async (req, res) => {
+  try {
+    needEnv("SUPABASE_URL");
+    needEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+    const quizId = req.params.id;
+    if (!quizId) return res.status(400).json({ error: "Missing quiz id" });
+
+    // lazy import (ca să nu crape dacă nu e instalat)
+    const { createClient } = require("@supabase/supabase-js");
+
+    const supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
+
+    // quiz
+    const { data: quiz, error: qErr } = await supabase
+      .from("quizzes")
+      .select("id, title, language, source_type, source_meta, created_at")
+      .eq("id", quizId)
+      .single();
+
+    if (qErr) return res.status(404).json({ error: qErr.message || "Quiz not found" });
+
+    // questions
+    const { data: questions, error: qsErr } = await supabase
+      .from("questions")
+      .select("id, idx, type, question, choices, answer")
+      .eq("quiz_id", quizId)
+      .order("idx", { ascending: true });
+
+    if (qsErr) return res.status(500).json({ error: qsErr.message || "Could not load questions" });
+
+    // nu trimitem answer către client? (la interactiv e OK doar dacă vrei verificare locală)
+    // eu îl trimit acum ca să meargă scorul fără endpoint separat.
+    // mai târziu îl ascundem și verificăm pe server.
+
+    return res.json({
+      quiz,
+      questions: (questions || []).map(q => ({
+        id: q.id,
+        idx: q.idx,
+        type: q.type,
+        question: q.question,
+        choices: q.choices,
+        answer: q.answer,
+      })),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: String(err.message || err) });
+  }
+});
 
 // GET one quiz + questions
 app.get("/api/quizzes/:id", async (req, res) => {
