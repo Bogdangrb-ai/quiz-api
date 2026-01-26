@@ -13,6 +13,6 @@
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^1.1.1",
     "tesseract.js": "^5.1.1",
-    "@supabase/supabase-js": "^2.39.7"
+    "@supabase/supabase-js": "^2.40.0"
   }
 }
