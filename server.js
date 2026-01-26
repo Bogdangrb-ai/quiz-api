@@ -225,15 +225,16 @@ async function saveQuizToDb({ user_id, title, language, source_type, source_meta
   const quiz_id = quizRow.id;
 
   // 2) insert questions
-  const rows = (questions || []).map((q, idx) => ({
-    quiz_id,
-    position: idx + 1,
-    type: q.type || "mcq",
-    question: q.question || "",
-    choices: q.choices || [],
-    answer: q.answer || "",
-    explanation: q.explanation || "",
-  }));
+ const rows = (questions || []).map((q, idx) => ({
+  quiz_id,
+  idx: idx, // sau idx+1, dar atunci și order trebuie la fel. Eu recomand 0-based cum ai deja în tabel.
+  type: q.type || "mcq",
+  question: q.question || "",
+  choices: q.choices || [],
+  answer: q.answer || "",
+  explanation: q.explanation || "",
+}));
+
 
   const { error: qsErr } = await supabase.from("questions").insert(rows);
   if (qsErr) throw new Error(qsErr.message);
@@ -343,10 +344,10 @@ app.get("/api/quizzes/:id", async (req, res) => {
     if (qErr) throw new Error(qErr.message);
 
     const { data: questions, error: qsErr } = await supabase
-      .from("questions")
-      .select("id,type,question,choices,answer,explanation,position")
-      .eq("quiz_id", id)
-      .order("position", { ascending: true });
+  .from("questions")
+  .select("id,type,question,choices,answer,explanation,idx")
+  .eq("quiz_id", id)
+  .order("idx", { ascending: true });
 
     if (qsErr) throw new Error(qsErr.message);
 
