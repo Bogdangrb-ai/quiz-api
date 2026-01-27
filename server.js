@@ -443,6 +443,122 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
   }
 });
 
+// ------------------- ATTEMPTS (INTERACTIVE) -------------------
+
+// Start attempt
+app.post("/api/attempts/start", async (req, res) => {
+  try {
+    const { quiz_id, user_id } = req.body || {};
+    if (!quiz_id) return res.status(400).json({ error: "Missing quiz_id" });
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    // total = nr intrebari
+    const { count, error: cErr } = await supabase
+      .from("questions")
+      .select("id", { count: "exact", head: true })
+      .eq("quiz_id", quiz_id);
+
+    if (cErr) throw new Error(cErr.message);
+    const total = Number(count || 0);
+
+    const { data, error } = await supabase
+      .from("attempts")
+      .insert([{
+        quiz_id,
+        user_id,
+        score: 0,
+        total,
+        started_at: new Date().toISOString(),
+        finished_at: null
+      }])
+      .select("id,quiz_id,user_id,score,total,started_at,finished_at")
+      .single();
+
+    if (error) throw new Error(error.message);
+    return res.json({ attempt: data });
+  } catch (err) {
+    return res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Save one answer
+app.post("/api/attempts/answer", async (req, res) => {
+  try {
+    const { attempt_id, question_id, user_answer } = req.body || {};
+    if (!attempt_id) return res.status(400).json({ error: "Missing attempt_id" });
+    if (!question_id) return res.status(400).json({ error: "Missing question_id" });
+    if (typeof user_answer !== "string") return res.status(400).json({ error: "Missing user_answer" });
+
+    // ia raspuns corect din DB
+    const { data: q, error: qErr } = await supabase
+      .from("questions")
+      .select("id,answer")
+      .eq("id", question_id)
+      .single();
+
+    if (qErr) throw new Error(qErr.message);
+
+    const is_correct = (q.answer || "") === user_answer;
+
+    // insert attempt_answer
+    const { error: aErr } = await supabase
+      .from("attempt_answers")
+      .insert([{
+        attempt_id,
+        question_id,
+        user_answer,
+        is_correct,
+        answered_at: new Date().toISOString()
+      }]);
+
+    if (aErr) throw new Error(aErr.message);
+
+    // daca e corect -> increment score in attempts
+    if (is_correct) {
+      const { data: att, error: attErr } = await supabase
+        .from("attempts")
+        .select("score")
+        .eq("id", attempt_id)
+        .single();
+      if (attErr) throw new Error(attErr.message);
+
+      const newScore = Number(att.score || 0) + 1;
+
+      const { error: upErr } = await supabase
+        .from("attempts")
+        .update({ score: newScore })
+        .eq("id", attempt_id);
+
+      if (upErr) throw new Error(upErr.message);
+    }
+
+    return res.json({ ok: true, is_correct });
+  } catch (err) {
+    return res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Finish attempt
+app.post("/api/attempts/finish", async (req, res) => {
+  try {
+    const { attempt_id } = req.body || {};
+    if (!attempt_id) return res.status(400).json({ error: "Missing attempt_id" });
+
+    const { data, error } = await supabase
+      .from("attempts")
+      .update({ finished_at: new Date().toISOString() })
+      .eq("id", attempt_id)
+      .select("id,quiz_id,user_id,score,total,started_at,finished_at")
+      .single();
+
+    if (error) throw new Error(error.message);
+    return res.json({ attempt: data });
+  } catch (err) {
+    return res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+
 // ------------------- START -------------------
 const port = Number(process.env.PORT || 3001);
 app.listen(port, () => console.log("Quiz API running on port", port));
