@@ -558,6 +558,72 @@ app.post("/api/attempts/finish", async (req, res) => {
   }
 });
 
+// SUMMARY attempts per user (grouped by quiz_id)
+app.get("/api/attempts/summary", async (req, res) => {
+  try {
+    const user_id = String(req.query.user_id || "").trim();
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    // luăm ultimele 500 attempts (ajunge pt MVP); apoi facem summary în Node
+    const { data, error } = await supabase
+      .from("attempts")
+      .select("id,quiz_id,score,total,finished_at,started_at,created_at")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (error) throw new Error(error.message);
+
+    const rows = data || [];
+    const map = new Map();
+
+    for (const a of rows) {
+      const qid = a.quiz_id;
+      if (!qid) continue;
+
+      const cur = map.get(qid) || {
+        quiz_id: qid,
+        attempts_count: 0,
+        best_score: null,
+        best_total: null,
+        last_score: null,
+        last_total: null,
+        last_finished_at: null
+      };
+
+      cur.attempts_count += 1;
+
+      // best
+      if (cur.best_score === null || Number(a.score) > Number(cur.best_score)) {
+        cur.best_score = a.score ?? 0;
+        cur.best_total = a.total ?? null;
+      }
+
+      // last = cel mai recent finished_at (sau created_at fallback)
+      const t = a.finished_at || a.created_at || a.started_at || null;
+      if (!cur.last_finished_at) {
+        cur.last_score = a.score ?? 0;
+        cur.last_total = a.total ?? null;
+        cur.last_finished_at = t;
+      } else {
+        const curTime = new Date(cur.last_finished_at).getTime();
+        const newTime = t ? new Date(t).getTime() : 0;
+        if (newTime > curTime) {
+          cur.last_score = a.score ?? 0;
+          cur.last_total = a.total ?? null;
+          cur.last_finished_at = t;
+        }
+      }
+
+      map.set(qid, cur);
+    }
+
+    res.json({ summary: Array.from(map.values()) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 
 // ------------------- START -------------------
 const port = Number(process.env.PORT || 3001);
