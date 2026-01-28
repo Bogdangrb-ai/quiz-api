@@ -11,7 +11,7 @@ const app = express();
 // ------------------- CONFIG -------------------
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json({ limit: "3mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 function needEnv(name) {
   if (!process.env[name]) throw new Error(`Missing environment variable: ${name}`);
@@ -35,6 +35,12 @@ function normalizeDifficulty(v) {
   return "medium";
 }
 
+// Guest user id helper (nu e autentificare reală, doar id simplu)
+function normalizeUserId(v) {
+  const s = String(v || "").trim();
+  return s || ("ro_guest_" + Math.random().toString(36).slice(2, 10));
+}
+
 // ------------------- SUPABASE -------------------
 needEnv("SUPABASE_URL");
 needEnv("SUPABASE_SERVICE_ROLE_KEY");
@@ -45,20 +51,17 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-// Guest user id helper (nu e autentificare, doar un id simplu)
-function normalizeUserId(v) {
-  const s = String(v || "").trim();
-  return s || ("ro_guest_" + Math.random().toString(36).slice(2, 10));
-}
-
 // ------------------- OPENAI (Responses API) -------------------
 function extractAnyTextFromResponsesApi(data) {
   if (!data) return "";
+
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
+
   const out = Array.isArray(data.output) ? data.output : [];
   const texts = [];
+
   for (const item of out) {
     const content = Array.isArray(item.content) ? item.content : [];
     for (const c of content) {
@@ -66,6 +69,7 @@ function extractAnyTextFromResponsesApi(data) {
       if (typeof c?.output_text === "string" && c.output_text.trim()) texts.push(c.output_text.trim());
     }
   }
+
   return texts.join("\n").trim();
 }
 
@@ -95,14 +99,19 @@ async function openaiCall({ input, schema }) {
   });
 
   const rawBody = await resp.text();
-  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}: ${rawBody.slice(0, 1200)}`);
+  if (!resp.ok) {
+    throw new Error(`OpenAI error ${resp.status}: ${rawBody.slice(0, 1200)}`);
+  }
 
   let data;
-  try { data = JSON.parse(rawBody); }
-  catch { throw new Error(`OpenAI returned non-JSON body: ${rawBody.slice(0, 1200)}`); }
+  try {
+    data = JSON.parse(rawBody);
+  } catch {
+    throw new Error(`OpenAI returned non-JSON body: ${rawBody.slice(0, 1200)}`);
+  }
 
   const outText = extractAnyTextFromResponsesApi(data);
-  if (!outText) throw new Error("OpenAI response had no extractable text (output_text/content empty).");
+  if (!outText) throw new Error("OpenAI response had no extractable text.");
   return outText;
 }
 
@@ -132,7 +141,7 @@ async function generateQuiz({ language, sourceText, options }) {
           properties: {
             type: { type: "string", enum: ["mcq"] },
             question: { type: "string" },
-            choices: { type: "array", items: { type: "string" }, minItems: 2 },
+            choices: { type: "array", minItems: 2, items: { type: "string" } },
             answer: { type: "string" },
             explanation: { type: "string" },
           },
@@ -170,6 +179,7 @@ ${trimmedSource}
   ];
 
   const out1 = await openaiCall({ input, schema });
+
   try {
     return JSON.parse(out1);
   } catch {
@@ -184,19 +194,30 @@ ${trimmedSource}
 
 // ------------------- DB SAVE HELPERS -------------------
 async function saveQuizToDb({ user_id, title, language, source_type, source_meta, settings, questions }) {
+  // 1) insert quiz
   const { data: quizRow, error: qErr } = await supabase
     .from("quizzes")
-    .insert([{ user_id, title, language, source_type, source_meta: source_meta || {}, settings: settings || {} }])
+    .insert([
+      {
+        user_id,
+        title,
+        language,
+        source_type,
+        source_meta: source_meta || {},
+        settings: settings || {},
+      },
+    ])
     .select("id")
     .single();
 
   if (qErr) throw new Error(qErr.message);
+
   const quiz_id = quizRow.id;
 
+  // 2) insert questions (FOLOSIM idx !!!)
   const rows = (questions || []).map((q, idx) => ({
     quiz_id,
-    // IMPORTANT: în DB la tine există "position" (nu idx)
-    position: idx,
+    idx, // 0..n-1
     type: q.type || "mcq",
     question: q.question || "",
     choices: q.choices || [],
@@ -210,16 +231,16 @@ async function saveQuizToDb({ user_id, title, language, source_type, source_meta
   return quiz_id;
 }
 
-function msToNice(sec) {
-  const s = Math.max(0, Math.floor(sec));
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return { m, s: r };
-}
-
 // ------------------- UPLOAD -------------------
-const uploadPdf = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
-const uploadImages = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 10 } });
+const uploadPdf = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
+const uploadImages = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 10 },
+});
 
 // ------------------- ROUTES -------------------
 app.get("/api/health", (req, res) => res.json({ ok: true }));
@@ -244,7 +265,7 @@ app.get("/api/quizzes", async (req, res) => {
   }
 });
 
-// GET one quiz + questions (folosit de pagina ta)
+// GET one quiz + questions (ORDER BY idx !!!)
 app.get("/api/quizzes/:id", async (req, res) => {
   try {
     const id = req.params.id;
@@ -259,9 +280,9 @@ app.get("/api/quizzes/:id", async (req, res) => {
 
     const { data: questions, error: qsErr } = await supabase
       .from("questions")
-      .select("id,type,question,choices,answer,explanation,position")
+      .select("id,type,question,choices,answer,explanation,idx")
       .eq("quiz_id", id)
-      .order("position", { ascending: true });
+      .order("idx", { ascending: true });
 
     if (qsErr) throw new Error(qsErr.message);
 
@@ -281,6 +302,7 @@ app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
     const language = normalizeLanguage(req.body.language);
     const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
     const difficulty = normalizeDifficulty(req.body.difficulty || "medium");
+
     const user_id = normalizeUserId(req.body.user_id);
 
     const parsed = await pdfParse(file.buffer);
@@ -318,6 +340,7 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
     const language = normalizeLanguage(req.body.language);
     const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
     const difficulty = normalizeDifficulty(req.body.difficulty || "medium");
+
     const user_id = normalizeUserId(req.body.user_id);
 
     let text = "";
@@ -354,9 +377,9 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
   }
 });
 
-// ------------------- ATTEMPTS (TIMP PE TOT QUIZ-UL) -------------------
+// ------------------- ATTEMPTS (Kahoot-style practice) -------------------
 
-// Start attempt
+// Start attempt: returns attempt_id + total
 app.post("/api/attempts/start", async (req, res) => {
   try {
     const quiz_id = String(req.body.quiz_id || "").trim();
@@ -364,18 +387,20 @@ app.post("/api/attempts/start", async (req, res) => {
 
     if (!quiz_id) return res.status(400).json({ error: "Missing quiz_id" });
 
-    const { count, error: cErr } = await supabase
+    // count questions
+    const { data: qs, error: cErr } = await supabase
       .from("questions")
-      .select("id", { count: "exact", head: true })
+      .select("id", { count: "exact" })
       .eq("quiz_id", quiz_id);
 
     if (cErr) throw new Error(cErr.message);
-    const total = Number(count || 0);
+
+    const total = Array.isArray(qs) ? qs.length : 0;
 
     const { data: attempt, error } = await supabase
       .from("attempts")
-      .insert([{ quiz_id, user_id, score: 0, total, started_at: new Date().toISOString(), finished_at: null }])
-      .select("*")
+      .insert([{ quiz_id, user_id, score: 0, total }])
+      .select("id,quiz_id,user_id,score,total,started_at,finished_at")
       .single();
 
     if (error) throw new Error(error.message);
@@ -386,7 +411,7 @@ app.post("/api/attempts/start", async (req, res) => {
   }
 });
 
-// Answer one question
+// Answer a question: saves user answer + is_correct, and updates score
 app.post("/api/attempts/answer", async (req, res) => {
   try {
     const attempt_id = String(req.body.attempt_id || "").trim();
@@ -397,7 +422,7 @@ app.post("/api/attempts/answer", async (req, res) => {
     if (!question_id) return res.status(400).json({ error: "Missing question_id" });
 
     // get correct answer
-    const { data: q, error: qErr } = await supabase
+    const { data: qRow, error: qErr } = await supabase
       .from("questions")
       .select("id,answer")
       .eq("id", question_id)
@@ -405,85 +430,72 @@ app.post("/api/attempts/answer", async (req, res) => {
 
     if (qErr) throw new Error(qErr.message);
 
-    const is_correct = (user_answer || "") === (q.answer || "");
+    const is_correct = user_answer === String(qRow.answer || "");
 
-    // upsert-ish: dacă user răspunde de 2 ori la aceeași întrebare, o considerăm ultima
-    // (simplu: ștergem răspunsul anterior și inserăm din nou)
-    await supabase
+    // insert attempt answer
+    const { error: insErr } = await supabase
       .from("attempt_answers")
-      .delete()
+      .insert([
+        {
+          attempt_id,
+          question_id,
+          user_answer,
+          is_correct,
+        },
+      ]);
+
+    if (insErr) throw new Error(insErr.message);
+
+    // update attempt score (recalculate to be safe)
+    const { data: correctRows, error: sErr } = await supabase
+      .from("attempt_answers")
+      .select("id")
       .eq("attempt_id", attempt_id)
-      .eq("question_id", question_id);
+      .eq("is_correct", true);
 
-    const { data: row, error } = await supabase
-      .from("attempt_answers")
-      .insert([{
-        attempt_id,
-        question_id,
-        user_answer,
-        is_correct,
-        answered_at: new Date().toISOString(),
-        selected: true
-      }])
-      .select("*")
+    if (sErr) throw new Error(sErr.message);
+
+    const newScore = Array.isArray(correctRows) ? correctRows.length : 0;
+
+    const { data: updated, error: upErr } = await supabase
+      .from("attempts")
+      .update({ score: newScore })
+      .eq("id", attempt_id)
+      .select("id,quiz_id,user_id,score,total,started_at,finished_at")
       .single();
 
-    if (error) throw new Error(error.message);
+    if (upErr) throw new Error(upErr.message);
 
-    res.json({ answer: row, is_correct });
+    res.json({ ok: true, is_correct, attempt: updated });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
 
-// Finish attempt (CALCULEAZĂ SCOR + DURATION_SEC)
+// Finish attempt: sets finished_at and returns attempt
 app.post("/api/attempts/finish", async (req, res) => {
   try {
     const attempt_id = String(req.body.attempt_id || "").trim();
     if (!attempt_id) return res.status(400).json({ error: "Missing attempt_id" });
 
-    // load attempt
-    const { data: attempt, error: aErr } = await supabase
-      .from("attempts")
-      .select("*")
-      .eq("id", attempt_id)
-      .single();
-
-    if (aErr) throw new Error(aErr.message);
-
-    // calc score
-    const { data: answers, error: ansErr } = await supabase
-      .from("attempt_answers")
-      .select("is_correct")
-      .eq("attempt_id", attempt_id);
-
-    if (ansErr) throw new Error(ansErr.message);
-
-    const score = (answers || []).filter(x => x.is_correct).length;
-
     const finished_at = new Date().toISOString();
 
-    // duration in seconds
-    const startedMs = attempt.started_at ? new Date(attempt.started_at).getTime() : Date.now();
-    const finishedMs = new Date(finished_at).getTime();
-    const duration_sec = Math.max(0, Math.round((finishedMs - startedMs) / 1000));
-
-    const { data: updated, error: upErr } = await supabase
+    const { data: updated, error } = await supabase
       .from("attempts")
-      .update({ score, finished_at })
+      .update({ finished_at })
       .eq("id", attempt_id)
-      .select("*")
+      .select("id,quiz_id,user_id,score,total,started_at,finished_at")
       .single();
 
-    if (upErr) throw new Error(upErr.message);
+    if (error) throw new Error(error.message);
 
-    res.json({ attempt: updated, duration_sec });
+    res.json({ attempt: updated });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
 
-// Stats pentru UI: încercări, best, ultimul (score + time)
+// Stats for a quiz + user (attempts count, best, last)
 app.get("/api/attempts/stats", async (req, res) => {
   try {
     const quiz_id = String(req.query.quiz_id || "").trim();
@@ -491,7 +503,7 @@ app.get("/api/attempts/stats", async (req, res) => {
     if (!quiz_id) return res.status(400).json({ error: "Missing quiz_id" });
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
 
-    const { data: rows, error } = await supabase
+    const { data, error } = await supabase
       .from("attempts")
       .select("id,score,total,started_at,finished_at")
       .eq("quiz_id", quiz_id)
@@ -501,43 +513,23 @@ app.get("/api/attempts/stats", async (req, res) => {
 
     if (error) throw new Error(error.message);
 
-    const attempts = rows || [];
+    const attempts = data || [];
     const count = attempts.length;
 
-    const withDur = attempts
-      .filter(a => a.finished_at && a.started_at)
-      .map(a => {
-        const d = Math.max(0, Math.round((new Date(a.finished_at).getTime() - new Date(a.started_at).getTime()) / 1000));
-        return { ...a, duration_sec: d };
-      });
-
     let best = null;
-    for (const a of withDur) {
-      if (!best) best = a;
-      else {
-        // best = scor mai mare, iar la egal scor = timp mai mic
-        if (a.score > best.score) best = a;
-        else if (a.score === best.score && a.duration_sec < best.duration_sec) best = a;
-      }
+    let last = null;
+
+    if (count > 0) {
+      last = attempts[0];
+      best = attempts.reduce((acc, a) => {
+        if (!acc) return a;
+        const aRate = (a.total || 0) ? (a.score || 0) / a.total : 0;
+        const accRate = (acc.total || 0) ? (acc.score || 0) / acc.total : 0;
+        return aRate > accRate ? a : acc;
+      }, null);
     }
 
-    const last = withDur[0] || null;
-
-    res.json({
-      count,
-      best: best ? {
-        score: best.score,
-        total: best.total,
-        duration_sec: best.duration_sec,
-        finished_at: best.finished_at
-      } : null,
-      last: last ? {
-        score: last.score,
-        total: last.total,
-        duration_sec: last.duration_sec,
-        finished_at: last.finished_at
-      } : null
-    });
+    res.json({ count, best, last });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   }
