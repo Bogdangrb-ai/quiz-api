@@ -29,12 +29,19 @@ function normalizeDifficulty(v) {
   return "medium";
 }
 
-// ✅ NORMALIZARE LIMBĂ STRICTĂ
 function normalizeLanguage(lang) {
   const s = String(lang || "").trim().toLowerCase();
-  const allowed = new Set(["ro","en","fr","de","es","it","pt","nl","pl","tr","uk","ru","ar","he","fa","ur","hi","zh","ja","ko"]);
+  const allowed = new Set([
+    "ro","en","fr","de","es","it","pt","nl","pl","tr","uk","ru",
+    "ar","he","fa","ur","hi","zh","ja","ko"
+  ]);
   if (allowed.has(s)) return s;
-  return "ro"; // default: română pentru site-ul RO
+  return "ro";
+}
+
+function normalizeUserId(v) {
+  const s = String(v || "").trim();
+  return s || ("ro_guest_" + Math.random().toString(36).slice(2, 10));
 }
 
 // ------------------- SUPABASE -------------------
@@ -47,10 +54,9 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-function normalizeUserId(v) {
-  const s = String(v || "").trim();
-  return s || ("ro_guest_" + Math.random().toString(36).slice(2, 10));
-}
+// ------------------- UPLOAD -------------------
+const uploadPdf = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const uploadImages = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 10 } });
 
 // ------------------- OPENAI (Responses API) -------------------
 function extractAnyTextFromResponsesApi(data) {
@@ -69,7 +75,7 @@ function extractAnyTextFromResponsesApi(data) {
   return texts.join("\n").trim();
 }
 
-async function openaiCall({ input, schema }) {
+async function openaiCall({ input, schema, temperature = 0.6, maxOutputTokens = 1500 }) {
   needEnv("OPENAI_API_KEY");
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -80,8 +86,8 @@ async function openaiCall({ input, schema }) {
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0,
-      max_output_tokens: 2500,
+      temperature,
+      max_output_tokens: maxOutputTokens,
       input,
       text: {
         format: {
@@ -94,41 +100,76 @@ async function openaiCall({ input, schema }) {
     }),
   });
 
-  const rawBody = await resp.text();
-  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}: ${rawBody.slice(0, 1400)}`);
+  const raw = await resp.text();
+  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}: ${raw.slice(0, 1400)}`);
 
   let data;
-  try { data = JSON.parse(rawBody); }
-  catch { throw new Error(`OpenAI returned non-JSON body: ${rawBody.slice(0, 1400)}`); }
+  try { data = JSON.parse(raw); }
+  catch { throw new Error(`OpenAI returned non-JSON body: ${raw.slice(0, 1400)}`); }
 
   const outText = extractAnyTextFromResponsesApi(data);
   if (!outText) throw new Error("OpenAI response had no extractable text.");
   return outText;
 }
 
-function looksLikeLanguage(text, lang) {
-  // euristic simplu: dacă user a cerut RO și primele 500 caractere au multe cuvinte engleze, respingem
-  const t = String(text || "").slice(0, 600).toLowerCase();
-  if (lang === "ro") {
-    const enHits = [" the ", " and ", " of ", " is ", " are ", "which", "what", "when", "where", "explanation"];
-    const hits = enHits.reduce((acc,w)=> acc + (t.includes(w) ? 1 : 0), 0);
-    return hits <= 2;
-  }
-  return true; // pentru restul nu blocăm acum
+// ------------------- VALIDATOR (ON-DEMAND) -------------------
+function looksRomanian(text) {
+  const t = String(text || "").slice(0, 700).toLowerCase();
+  const enHits = [" the ", " and ", " of ", " is ", " are ", "which", "what", "when", "where", "explanation"];
+  const hits = enHits.reduce((acc, w) => acc + (t.includes(w) ? 1 : 0), 0);
+  return hits <= 2;
 }
 
-async function generateQuiz({ language, sourceText, options, extraMeta }) {
-  const numberOfQuestions = safeNumber(options?.numberOfQuestions, 10);
-  const difficulty = normalizeDifficulty(options?.difficulty || "medium");
+function validateQuizStrict({ quiz, language, numberOfQuestions }) {
+  const problems = [];
 
-  const MAX_SOURCE_CHARS = 18000;
-  const trimmedSource =
-    (sourceText || "").length > MAX_SOURCE_CHARS
-      ? (sourceText || "").slice(0, MAX_SOURCE_CHARS) + "\n\n[NOTE: Source was truncated.]"
-      : (sourceText || "");
+  if (!quiz || typeof quiz !== "object") problems.push("Quiz is not an object.");
+  if (!quiz.title || typeof quiz.title !== "string") problems.push("Missing title.");
+  if (quiz.language !== language) problems.push(`language must be exactly '${language}'.`);
 
-  // ✅ STRICT SCHEMA + language inclus ca validare
-  const schema = {
+  const qs = quiz.questions;
+  if (!Array.isArray(qs) || qs.length < 1) problems.push("questions must be a non-empty array.");
+
+  if (Array.isArray(qs)) {
+    if (numberOfQuestions && qs.length !== numberOfQuestions) {
+      // nu e “fatal”, dar îl corectăm ca să respecte cerința
+      problems.push(`questions length must be exactly ${numberOfQuestions}.`);
+    }
+
+    const seen = new Set();
+    qs.forEach((q, i) => {
+      if (!q || typeof q !== "object") return problems.push(`Question ${i} invalid object.`);
+      if (q.type !== "mcq") problems.push(`Question ${i}: type must be 'mcq'.`);
+      if (!q.question || typeof q.question !== "string") problems.push(`Question ${i}: missing question text.`);
+      if (!Array.isArray(q.choices) || q.choices.length !== 3) problems.push(`Question ${i}: choices must be exactly 3.`);
+      if (Array.isArray(q.choices)) {
+        const uniq = new Set(q.choices.map(x => String(x).trim()));
+        if (uniq.size !== q.choices.length) problems.push(`Question ${i}: choices must be distinct.`);
+      }
+      if (!q.answer || typeof q.answer !== "string") problems.push(`Question ${i}: missing answer.`);
+      if (Array.isArray(q.choices) && !q.choices.includes(q.answer)) problems.push(`Question ${i}: answer must match one of the choices exactly.`);
+      if (q.explanation != null && typeof q.explanation !== "string") problems.push(`Question ${i}: explanation must be a string.`);
+      // duplicate question check
+      const key = String(q.question || "").toLowerCase().trim().slice(0, 120);
+      if (key) {
+        if (seen.has(key)) problems.push(`Duplicate question detected near question ${i}.`);
+        seen.add(key);
+      }
+    });
+  }
+
+  // limbă RO check (doar dacă ro)
+  if (language === "ro") {
+    const blob = JSON.stringify(quiz);
+    if (!looksRomanian(blob)) problems.push("Output does not look Romanian.");
+  }
+
+  return problems;
+}
+
+// ------------------- QUIZ GENERATION -------------------
+function buildSchema({ language, numberOfQuestions }) {
+  return {
     type: "object",
     additionalProperties: false,
     required: ["title", "language", "questions"],
@@ -137,7 +178,8 @@ async function generateQuiz({ language, sourceText, options, extraMeta }) {
       language: { type: "string", enum: [language] },
       questions: {
         type: "array",
-        minItems: 1,
+        minItems: numberOfQuestions,
+        maxItems: numberOfQuestions,
         items: {
           type: "object",
           additionalProperties: false,
@@ -153,11 +195,12 @@ async function generateQuiz({ language, sourceText, options, extraMeta }) {
       },
     },
   };
+}
 
-  // ✅ Meta de context (facultate/materie etc.) — ajută, dar NU e obligatoriu
-  const metaBlock = extraMeta
-    ? `
-CONTEXT (may help you write better questions, but do NOT invent facts):
+function buildMetaBlock(extraMeta) {
+  if (!extraMeta) return "";
+  return `
+CONTEXT (use this to adapt difficulty/style, but DO NOT invent facts for PDF/Image modes):
 - level: ${extraMeta.level || ""}
 - classYear: ${extraMeta.classYear || ""}
 - facultyYear: ${extraMeta.facultyYear || ""}
@@ -167,30 +210,59 @@ CONTEXT (may help you write better questions, but do NOT invent facts):
 - subject: ${extraMeta.subject || ""}
 - profile: ${extraMeta.profile || ""}
 - topic: ${extraMeta.topic || ""}
-`
-    : "";
+- variant: ${extraMeta.variant || ""}
+`;
+}
+
+async function generateQuizFromSource({
+  language,
+  sourceText,
+  options,
+  extraMeta,
+  allowGeneralKnowledge = false,
+}) {
+  const numberOfQuestions = safeNumber(options?.numberOfQuestions, 10);
+  const difficulty = normalizeDifficulty(options?.difficulty || "medium");
+  const variant = String(extraMeta?.variant || "").trim() || Math.random().toString(36).slice(2, 10);
+
+  // trim input for speed
+  const MAX_SOURCE_CHARS = 14000;
+  const trimmedSource =
+    (sourceText || "").length > MAX_SOURCE_CHARS
+      ? (sourceText || "").slice(0, MAX_SOURCE_CHARS) + "\n\n[NOTE: Source was truncated.]"
+      : (sourceText || "");
+
+  const schema = buildSchema({ language, numberOfQuestions });
+
+  const metaBlock = buildMetaBlock({ ...extraMeta, variant });
 
   const systemPrompt =
-    "You return ONLY valid JSON that matches the provided JSON schema. " +
+    "Return ONLY valid JSON that matches the provided JSON schema. " +
     "No markdown. No extra text. " +
     "CRITICAL: Write EVERYTHING strictly in the requested language. " +
-    "If the user requested Romanian (ro), do NOT output English.";
+    "Avoid repeating the same concept; make questions cover different key points.";
+
+  const knowledgeRule = allowGeneralKnowledge
+    ? "You MAY use general knowledge, but stay strictly within the chosen subject/topic and level."
+    : "Use ONLY the source text. Do NOT invent outside facts.";
 
   const userPrompt = `
 LANGUAGE: ${language}
 DIFFICULTY: ${difficulty}
 NUMBER_OF_QUESTIONS: ${numberOfQuestions}
+VARIANT: ${variant}
 
 Rules:
 - Output language MUST be exactly: ${language}
-- Multiple choice ONLY: 3 choices per question (exactly 3).
-- 'answer' MUST match one of the choices exactly.
-- Use ONLY the source text. Do not invent outside facts.
-- Keep explanations short (1-2 sentences).
+- Multiple-choice ONLY: exactly 3 choices per question.
+- Answer MUST match one of the choices exactly.
+- Keep explanations short (1 sentence).
+- Make questions diverse: definitions, conditions, exceptions, steps, examples (when possible).
+- ${knowledgeRule}
 
 ${metaBlock}
 
-SOURCE TEXT:
+SOURCE:
 <<<
 ${trimmedSource}
 >>>
@@ -201,31 +273,48 @@ ${trimmedSource}
     { role: "user", content: userPrompt },
   ];
 
-  const out1 = await openaiCall({ input, schema });
+  // 1) generate (faster + diversity)
+  const out1 = await openaiCall({ input, schema, temperature: 0.65, maxOutputTokens: 1500 });
 
-  // ✅ parse + fallback repair
-  let parsed;
-  try { parsed = JSON.parse(out1); }
+  let quiz;
+  try { quiz = JSON.parse(out1); }
   catch {
+    // quick repair if JSON broken
     const repairInput = [
       { role: "system", content: "Return ONLY valid JSON matching the schema. No extra text." },
       { role: "user", content: `Fix into valid JSON only:\n\n${out1}` },
     ];
-    const out2 = await openaiCall({ input: repairInput, schema });
-    parsed = JSON.parse(out2);
+    const out2 = await openaiCall({ input: repairInput, schema, temperature: 0, maxOutputTokens: 1500 });
+    quiz = JSON.parse(out2);
   }
 
-  // ✅ verificare limbă (doar pentru ro, ca să nu mai iasă EN)
-  if (!looksLikeLanguage(JSON.stringify(parsed), language)) {
-    const retryInput = [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt + "\n\nIMPORTANT: Your previous output was not in the requested language. Regenerate in the correct language ONLY." },
+  // 2) validate on-demand (only if needed)
+  const problems = validateQuizStrict({ quiz, language, numberOfQuestions });
+  if (problems.length) {
+    const fixPrompt = `
+You must output ONLY valid JSON that matches the schema exactly.
+Fix these problems:
+- ${problems.join("\n- ")}
+
+Keep content in language: ${language}.
+Keep exactly ${numberOfQuestions} questions.
+Keep exactly 3 choices per question.
+Ensure answer matches a choice.
+
+Here is the previous JSON to fix:
+<<<
+${JSON.stringify(quiz)}
+>>>
+`;
+    const fixInput = [
+      { role: "system", content: "Return ONLY valid JSON matching the provided schema. No extra text." },
+      { role: "user", content: fixPrompt },
     ];
-    const outRetry = await openaiCall({ input: retryInput, schema });
-    parsed = JSON.parse(outRetry);
+    const outFix = await openaiCall({ input: fixInput, schema, temperature: 0, maxOutputTokens: 1500 });
+    quiz = JSON.parse(outFix);
   }
 
-  return parsed;
+  return quiz;
 }
 
 // ------------------- DB SAVE HELPERS -------------------
@@ -242,7 +331,7 @@ async function saveQuizToDb({ user_id, title, language, source_type, source_meta
 
   const rows = (questions || []).map((q, idx) => ({
     quiz_id,
-    idx,                  // ✅ folosim idx (cum ai în DB)
+    idx,
     type: q.type || "mcq",
     question: q.question || "",
     choices: q.choices || [],
@@ -255,10 +344,6 @@ async function saveQuizToDb({ user_id, title, language, source_type, source_meta
 
   return quiz_id;
 }
-
-// ------------------- UPLOAD -------------------
-const uploadPdf = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
-const uploadImages = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 10 } });
 
 // ------------------- ROUTES -------------------
 app.get("/api/health", (req, res) => res.json({ ok: true }));
@@ -333,14 +418,16 @@ app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
       institution: req.body.institution,
       subject: req.body.subject,
       profile: req.body.profile,
-      topic: req.body.topic
+      topic: req.body.topic,
+      variant: req.body.variant,
     };
 
-    const quiz = await generateQuiz({
+    const quiz = await generateQuizFromSource({
       language,
       sourceText: text,
       options: { numberOfQuestions, difficulty },
-      extraMeta
+      extraMeta,
+      allowGeneralKnowledge: false,
     });
 
     const quiz_id = await saveQuizToDb({
@@ -378,7 +465,6 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
       const r = await Tesseract.recognize(f.buffer, "eng");
       text += "\n" + (r.data.text || "");
     }
-
     text = text.trim();
     if (!text) return res.status(400).json({ error: "OCR produced no text" });
 
@@ -391,14 +477,16 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
       institution: req.body.institution,
       subject: req.body.subject,
       profile: req.body.profile,
-      topic: req.body.topic
+      topic: req.body.topic,
+      variant: req.body.variant,
     };
 
-    const quiz = await generateQuiz({
+    const quiz = await generateQuizFromSource({
       language,
       sourceText: text,
       options: { numberOfQuestions, difficulty },
-      extraMeta
+      extraMeta,
+      allowGeneralKnowledge: false,
     });
 
     const quiz_id = await saveQuizToDb({
@@ -407,6 +495,68 @@ app.post("/api/quiz/images", uploadImages.array("images", 10), async (req, res) 
       language,
       source_type: "images",
       source_meta: { count: files.length },
+      settings: { numberOfQuestions, difficulty },
+      questions: quiz.questions || [],
+    });
+
+    res.json({ ...quiz, quiz_id });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// TOPIC (fără fișiere) -> generate -> save -> return
+app.post("/api/quiz/topic", async (req, res) => {
+  try {
+    const language = normalizeLanguage(req.body.language);
+    const numberOfQuestions = safeNumber(req.body.numberOfQuestions, 10);
+    const difficulty = normalizeDifficulty(req.body.difficulty || "medium");
+    const user_id = normalizeUserId(req.body.user_id);
+
+    const subject = String(req.body.subject || "").trim();
+    const profile = String(req.body.profile || "").trim();
+    const topic = String(req.body.topic || "").trim();
+
+    if (!subject) return res.status(400).json({ error: "Missing subject (materie)" });
+
+    const extraMeta = {
+      level: req.body.level,
+      classYear: req.body.classYear,
+      facultyYear: req.body.facultyYear,
+      masterYear: req.body.masterYear,
+      phdYear: req.body.phdYear,
+      institution: req.body.institution,
+      subject,
+      profile,
+      topic,
+      variant: req.body.variant,
+    };
+
+    // “sourceText” e cererea userului (aici permitem knowledge)
+    const sourceText = `
+User selected:
+- Subject: ${subject}
+- Profile: ${profile}
+- Topic: ${topic}
+- Level: ${extraMeta.level || ""}
+- Class/Year: ${extraMeta.classYear || extraMeta.facultyYear || ""}
+Make a quiz within this scope.
+`.trim();
+
+    const quiz = await generateQuizFromSource({
+      language,
+      sourceText,
+      options: { numberOfQuestions, difficulty },
+      extraMeta,
+      allowGeneralKnowledge: true,
+    });
+
+    const quiz_id = await saveQuizToDb({
+      user_id,
+      title: quiz.title || `${subject}${topic ? " — " + topic : ""}`,
+      language,
+      source_type: "topic",
+      source_meta: { subject, profile, topic },
       settings: { numberOfQuestions, difficulty },
       questions: quiz.questions || [],
     });
