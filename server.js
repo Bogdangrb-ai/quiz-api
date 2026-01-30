@@ -1,26 +1,26 @@
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const pdfParse = require("pdf-parse");
-const Tesseract = require("tesseract.js");
-const { createClient } = require("@supabase/supabase-js");
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import pdfParse from "pdf-parse";
+import Tesseract from "tesseract.js";
+import { createClient } from "@supabase/supabase-js";
 
+/* ===================== APP ===================== */
 const app = express();
-
-/* ===================== CONFIG ===================== */
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-function needEnv(name) {
+/* ===================== ENV CHECK ===================== */
+function need(name) {
   if (!process.env[name]) {
-    throw new Error(`Missing environment variable: ${name}`);
+    throw new Error(`Missing env var: ${name}`);
   }
 }
 
-needEnv("OPENAI_API_KEY");
-needEnv("SUPABASE_URL");
-needEnv("SUPABASE_SERVICE_ROLE_KEY");
+need("OPENAI_API_KEY");
+need("SUPABASE_URL");
+need("SUPABASE_SERVICE_ROLE_KEY");
 
 /* ===================== SUPABASE ===================== */
 const supabase = createClient(
@@ -35,32 +35,18 @@ const uploadPdf = multer({
   limits: { fileSize: 25 * 1024 * 1024 },
 });
 
-const uploadImages = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024, files: 10 },
-});
-
 /* ===================== HELPERS ===================== */
-function normalizeLanguage(lang) {
-  if (!lang) return "ro";
-  return String(lang).toLowerCase().trim() || "ro";
-}
+const normalizeLang = (v) => (v || "ro").toLowerCase();
+const normalizeDiff = (v) =>
+  ["easy", "usor"].includes(v) ? "easy" :
+  ["hard", "greu"].includes(v) ? "hard" : "medium";
 
-function normalizeDifficulty(v) {
-  const s = String(v || "").toLowerCase();
-  if (["easy", "usor", "ușor"].includes(s)) return "easy";
-  if (["hard", "greu"].includes(s)) return "hard";
-  return "medium";
-}
-
-function normalizeUserId(v) {
-  const s = String(v || "").trim();
-  return s || ("ro_guest_" + Math.random().toString(36).slice(2, 10));
-}
+const normalizeUser = (v) =>
+  v && v.trim() ? v.trim() : "guest_" + Math.random().toString(36).slice(2, 10);
 
 /* ===================== OPENAI ===================== */
 async function callOpenAI(prompt) {
-  const resp = await fetch("https://api.openai.com/v1/responses", {
+  const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -68,107 +54,70 @@ async function callOpenAI(prompt) {
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0.8,
+      temperature: 0.85,
       max_output_tokens: 3000,
       input: prompt,
     }),
   });
 
-  const text = await resp.text();
-  if (!resp.ok) {
-    throw new Error(text);
-  }
+  const t = await r.text();
+  if (!r.ok) throw new Error(t);
 
-  const data = JSON.parse(text);
-  return data.output_text || "";
+  const j = JSON.parse(t);
+  return j.output_text || "";
 }
 
 /* ===================== PROMPT ===================== */
-function buildPrompt({
-  language,
-  sourceText,
-  subject,
-  topic,
-  level,
-  difficulty,
-  numberOfQuestions,
-  quizIndex,
-}) {
+function buildPrompt({ lang, text, subject, topic, diff, index }) {
   return `
-Ești un profesor foarte bun, exigent și clar în explicații.
-Creezi quiz-uri de nivel examen, care testează înțelegerea reală.
+LIMBA: ${lang}
+DIFICULTATE: ${diff}
+QUIZ INDEX: ${index}
 
-LIMBA: ${language}
-NIVEL: ${level}
-DIFICULTATE: ${difficulty}
-NUMĂR ÎNTREBĂRI: ${numberOfQuestions}
-QUIZ INDEX: ${quizIndex}
+Creează un quiz de nivel EXAMEN.
+Întrebările trebuie să fie diferite de quizurile anterioare.
 
-MATERIE: ${subject || "din text"}
-SUBIECT: ${topic || "general"}
-
-REGULI:
-- EXACT ${numberOfQuestions} întrebări
-- FIECARE întrebare are EXACT 3 variante
-- DOAR o explicație clară și mai detaliată
-- FĂRĂ texte inutile
-- FĂRĂ engleză dacă limba este română
-- NU repeta idei între întrebări
-- Crește dificultatea progresiv dacă quizIndex > 1
-
-FORMAT OBLIGATORIU (JSON PUR):
+FORMAT STRICT JSON:
 {
-  "title": "Titlu quiz",
+  "title": "Titlu",
   "questions": [
     {
-      "question": "Întrebare clară",
+      "question": "...",
       "choices": ["A", "B", "C"],
       "answer": "A",
-      "explanation": "Explicație clară, coerentă și suficient de detaliată pentru a înțelege conceptul."
+      "explanation": "Explicație clară și coerentă."
     }
   ]
 }
 
-TEXT SURSĂ (dacă există):
+SUBIECT: ${subject || "din text"}
+TEMĂ: ${topic || "general"}
+
+TEXT:
 <<<
-${sourceText || ""}
+${text || ""}
 >>>
 `;
 }
 
-/* ===================== GENERATE QUIZ ===================== */
+/* ===================== GENERATE ===================== */
 async function generateQuiz(opts) {
-  const prompt = buildPrompt(opts);
-  const raw = await callOpenAI(prompt);
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new Error("OpenAI a returnat JSON invalid.");
-  }
+  const raw = await callOpenAI(buildPrompt(opts));
+  return JSON.parse(raw);
 }
 
-/* ===================== SAVE QUIZ ===================== */
-async function saveQuiz({ user_id, quiz, meta }) {
-  const { data: qRow, error: qErr } = await supabase
+/* ===================== SAVE ===================== */
+async function saveQuiz(user_id, quiz, meta) {
+  const { data, error } = await supabase
     .from("quizzes")
-    .insert([{
-      user_id,
-      title: quiz.title,
-      language: meta.language,
-      source_type: meta.source_type,
-      source_meta: meta.source_meta,
-      settings: meta.settings,
-    }])
+    .insert([{ user_id, title: quiz.title, ...meta }])
     .select("id")
     .single();
 
-  if (qErr) throw new Error(qErr.message);
-
-  const quiz_id = qRow.id;
+  if (error) throw error;
 
   const rows = quiz.questions.map((q, i) => ({
-    quiz_id,
+    quiz_id: data.id,
     position: i + 1,
     type: "mcq",
     question: q.question,
@@ -177,88 +126,33 @@ async function saveQuiz({ user_id, quiz, meta }) {
     explanation: q.explanation,
   }));
 
-  const { error: qsErr } = await supabase.from("questions").insert(rows);
-  if (qsErr) throw new Error(qsErr.message);
-
-  return quiz_id;
+  await supabase.from("questions").insert(rows);
+  return data.id;
 }
 
 /* ===================== ROUTES ===================== */
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
-});
+app.get("/api/health", (_, res) => res.json({ ok: true }));
 
-/* ===== PDF ===== */
 app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
   try {
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: "Missing PDF" });
-
-    const parsed = await pdfParse(file.buffer);
-    if (!parsed.text) throw new Error("Nu s-a putut extrage textul.");
-
-    const user_id = normalizeUserId(req.body.user_id);
-    const language = normalizeLanguage(req.body.language);
-    const difficulty = normalizeDifficulty(req.body.difficulty);
+    const parsed = await pdfParse(req.file.buffer);
+    const user = normalizeUser(req.body.user_id);
 
     const quiz = await generateQuiz({
-      language,
-      sourceText: parsed.text,
+      lang: normalizeLang(req.body.language),
+      diff: normalizeDiff(req.body.difficulty),
       subject: req.body.subject,
       topic: req.body.topic,
-      level: req.body.level || "general",
-      difficulty,
-      numberOfQuestions: 10,
-      quizIndex: Number(req.body.quizIndex || 1),
+      text: parsed.text,
+      index: Number(req.body.quizIndex || 1),
     });
 
-    const quiz_id = await saveQuiz({
-      user_id,
-      quiz,
-      meta: {
-        language,
-        source_type: "pdf",
-        source_meta: { filename: file.originalname },
-        settings: { difficulty, numberOfQuestions: 10 },
-      },
+    const id = await saveQuiz(user, quiz, {
+      language: req.body.language,
+      source_type: "pdf",
     });
 
-    res.json({ quiz_id, quiz });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/* ===== TOPIC ===== */
-app.post("/api/quiz/topic", async (req, res) => {
-  try {
-    const user_id = normalizeUserId(req.body.user_id);
-    const language = normalizeLanguage(req.body.language);
-    const difficulty = normalizeDifficulty(req.body.difficulty);
-
-    const quiz = await generateQuiz({
-      language,
-      sourceText: "",
-      subject: req.body.subject,
-      topic: req.body.topic,
-      level: req.body.level || "general",
-      difficulty,
-      numberOfQuestions: 10,
-      quizIndex: Number(req.body.quizIndex || 1),
-    });
-
-    const quiz_id = await saveQuiz({
-      user_id,
-      quiz,
-      meta: {
-        language,
-        source_type: "topic",
-        source_meta: { subject: req.body.subject, topic: req.body.topic },
-        settings: { difficulty, numberOfQuestions: 10 },
-      },
-    });
-
-    res.json({ quiz_id, quiz });
+    res.json({ quiz_id: id });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -266,6 +160,6 @@ app.post("/api/quiz/topic", async (req, res) => {
 
 /* ===================== START ===================== */
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log("✅ SmartQuiz API running on port", PORT);
-});
+app.listen(PORT, () =>
+  console.log("✅ Quiz API running on", PORT)
+);
