@@ -2,164 +2,137 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import pdfParse from "pdf-parse";
-import Tesseract from "tesseract.js";
+import fetch from "node-fetch";
+import pdf from "pdf-parse";
 import { createClient } from "@supabase/supabase-js";
 
-/* ===================== APP ===================== */
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+const PORT = process.env.PORT || 3001;
 
-/* ===================== ENV CHECK ===================== */
-function need(name) {
-  if (!process.env[name]) {
-    throw new Error(`Missing env var: ${name}`);
-  }
-}
+/* =========================
+   CONFIG
+========================= */
 
-need("OPENAI_API_KEY");
-need("SUPABASE_URL");
-need("SUPABASE_SERVICE_ROLE_KEY");
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGIN || "*"
+}));
+app.use(express.json());
 
-/* ===================== SUPABASE ===================== */
+const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
+
+/* =========================
+   SUPABASE
+========================= */
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ===================== UPLOAD ===================== */
-const uploadPdf = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+/* =========================
+   HEALTH CHECK
+========================= */
+
+app.get("/", (req, res) => {
+  res.json({ ok: true, status: "Quiz API running" });
 });
 
-/* ===================== HELPERS ===================== */
-const normalizeLang = (v) => (v || "ro").toLowerCase();
-const normalizeDiff = (v) =>
-  ["easy", "usor"].includes(v) ? "easy" :
-  ["hard", "greu"].includes(v) ? "hard" : "medium";
+/* =========================
+   OPENAI HELPER
+========================= */
 
-const normalizeUser = (v) =>
-  v && v.trim() ? v.trim() : "guest_" + Math.random().toString(36).slice(2, 10);
+async function callOpenAI(prompt, temperature = 0.8) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY lipsă din environment");
+  }
 
-/* ===================== OPENAI ===================== */
-async function callOpenAI(prompt) {
-  const r = await fetch("https://api.openai.com/v1/responses", {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0.85,
-      max_output_tokens: 3000,
-      input: prompt,
-    }),
+      temperature,
+      messages: [
+        {
+          role: "system",
+          content: "Ești un generator de quiz-uri educaționale foarte precise."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ]
+    })
   });
 
-  const t = await r.text();
-  if (!r.ok) throw new Error(t);
+  const data = await response.json();
 
-  const j = JSON.parse(t);
-  return j.output_text || "";
+  if (!response.ok) {
+    throw new Error(data.error?.message || "Eroare OpenAI");
+  }
+
+  return data.choices[0].message.content;
 }
 
-/* ===================== PROMPT ===================== */
-function buildPrompt({ lang, text, subject, topic, diff, index }) {
-  return `
-LIMBA: ${lang}
-DIFICULTATE: ${diff}
-QUIZ INDEX: ${index}
+/* =========================
+   PDF → QUIZ
+========================= */
 
-Creează un quiz de nivel EXAMEN.
-Întrebările trebuie să fie diferite de quizurile anterioare.
+app.post("/api/quiz/pdf", upload.single("file"), async (req, res) => {
+  try {
+    const buffer = req.file.buffer;
+    const parsed = await pdf(buffer);
+    const text = parsed.text.slice(0, 12000);
 
-FORMAT STRICT JSON:
-{
-  "title": "Titlu",
-  "questions": [
-    {
-      "question": "...",
-      "choices": ["A", "B", "C"],
-      "answer": "A",
-      "explanation": "Explicație clară și coerentă."
-    }
-  ]
-}
-
-SUBIECT: ${subject || "din text"}
-TEMĂ: ${topic || "general"}
+    const prompt = `
+Generează 10 întrebări grilă (3 variante) din textul de mai jos.
+Limba: română.
+Răspunde STRICT în JSON cu format:
+[
+  {
+    "question": "...",
+    "choices": ["A","B","C"],
+    "answer": "A"
+  }
+]
 
 TEXT:
-<<<
-${text || ""}
->>>
+${text}
 `;
-}
 
-/* ===================== GENERATE ===================== */
-async function generateQuiz(opts) {
-  const raw = await callOpenAI(buildPrompt(opts));
-  return JSON.parse(raw);
-}
+    const aiRaw = await callOpenAI(prompt);
+    const questions = JSON.parse(aiRaw);
 
-/* ===================== SAVE ===================== */
-async function saveQuiz(user_id, quiz, meta) {
-  const { data, error } = await supabase
-    .from("quizzes")
-    .insert([{ user_id, title: quiz.title, ...meta }])
-    .select("id")
-    .single();
+    const { data: quiz } = await supabase
+      .from("quizzes")
+      .insert({ title: "Quiz din PDF", language: "ro", source_type: "pdf" })
+      .select()
+      .single();
 
-  if (error) throw error;
+    for (let i = 0; i < questions.length; i++) {
+      await supabase.from("questions").insert({
+        quiz_id: quiz.id,
+        idx: i + 1,
+        question: questions[i].question,
+        choices: questions[i].choices,
+        answer: questions[i].answer
+      });
+    }
 
-  const rows = quiz.questions.map((q, i) => ({
-    quiz_id: data.id,
-    position: i + 1,
-    type: "mcq",
-    question: q.question,
-    choices: q.choices,
-    answer: q.answer,
-    explanation: q.explanation,
-  }));
+    res.json({ quiz_id: quiz.id });
 
-  await supabase.from("questions").insert(rows);
-  return data.id;
-}
-
-/* ===================== ROUTES ===================== */
-app.get("/api/health", (_, res) => res.json({ ok: true }));
-
-app.post("/api/quiz/pdf", uploadPdf.single("file"), async (req, res) => {
-  try {
-    const parsed = await pdfParse(req.file.buffer);
-    const user = normalizeUser(req.body.user_id);
-
-    const quiz = await generateQuiz({
-      lang: normalizeLang(req.body.language),
-      diff: normalizeDiff(req.body.difficulty),
-      subject: req.body.subject,
-      topic: req.body.topic,
-      text: parsed.text,
-      index: Number(req.body.quizIndex || 1),
-    });
-
-    const id = await saveQuiz(user, quiz, {
-      language: req.body.language,
-      source_type: "pdf",
-    });
-
-    res.json({ quiz_id: id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-/* ===================== START ===================== */
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () =>
-  console.log("✅ Quiz API running on", PORT)
-);
+/* =========================
+   START SERVER
+========================= */
+
+app.listen(PORT, () => {
+  console.log("✅ Quiz API running on", PORT);
+});
