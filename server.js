@@ -3,7 +3,8 @@
  * - Express API pentru QuizRo
  * - Supabase (quizzes + questions)
  * - OpenAI pentru generare întrebări
- * - Fix important: user_id NU mai ajunge NULL (se ia din body/form-data)
+ * - Fix important: user_id NU mai ajunge NULL (se ia din body/form-data/headers)
+ * - Fix important: Multer “Unexpected field” (acceptă și pdf/file + images/files)
  * - Output OpenAI este “curățat” (scoate ```json ... ```)
  *
  * Necesită în Render / ENV:
@@ -45,6 +46,7 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY || "" });
 // ---------- MIDDLEWARE ----------
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
+
 app.use(
   cors({
     origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
@@ -75,21 +77,16 @@ function safeUserId(req) {
 }
 
 function stripCodeFences(text) {
-  // scoate ```json ... ``` sau ``` ... ```
   if (!text) return "";
   let t = text.trim();
 
-  // dacă începe cu ```
   if (t.startsWith("```")) {
-    // taie prima linie ```json sau ```
     const firstNewline = t.indexOf("\n");
     if (firstNewline !== -1) t = t.slice(firstNewline + 1);
-    // taie ultima apariție ```
     const lastFence = t.lastIndexOf("```");
     if (lastFence !== -1) t = t.slice(0, lastFence);
   }
 
-  // mai scoate eventualele “```json” rămase
   t = t.replace(/^json\s*/i, "").trim();
   return t;
 }
@@ -98,22 +95,18 @@ function tryParseJSON(maybeJSON) {
   const cleaned = stripCodeFences(maybeJSON);
   try {
     return JSON.parse(cleaned);
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
 // încearcă insert cu câmpuri care poate există / poate nu în schema ta
 async function supabaseInsertSmart(table, payload) {
-  // încercăm prima dată cu payload complet
   let { data, error } = await supabase.from(table).insert(payload).select("*").single();
-
   if (!error) return { data, error: null };
 
-  // dacă eroarea e de tip “Could not find the 'X' column”
-  // atunci eliminăm câmpul X și reîncercăm (într-o buclă limitată)
   let p = { ...payload };
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 12; i++) {
     const msg = (error?.message || "").toString();
     const m = msg.match(/Could not find the '([^']+)' column/i);
     if (!m) break;
@@ -129,7 +122,6 @@ async function supabaseInsertSmart(table, payload) {
 }
 
 function normalizeQuestions(raw) {
-  // Acceptă: array de întrebări sau obiect cu {questions:[...]}
   const arr = Array.isArray(raw) ? raw : raw?.questions;
   if (!Array.isArray(arr)) return [];
 
@@ -161,8 +153,6 @@ function buildPrompt({ sourceText, topic, subject, profile, language, difficulty
   const diff = difficulty || "Mediu";
   const n = count || 10;
 
-  // Prompt orientat spre calitate (întrebări mai bune)
-  // Output strict JSON (fără markdown)
   return `
 Ești un profesor excelent. Creează un quiz de calitate foarte mare (grilă, 3-4 variante) pe baza materialului dat.
 
@@ -196,6 +186,15 @@ FORMAT OUTPUT (STRICT JSON, fără \`\`\`, fără text extra):
   ]
 }
 `.trim();
+}
+
+function pickFirstFileFromFields(req, names) {
+  // multer.fields => req.files este obiect: {name:[file]}
+  for (const n of names) {
+    const arr = req.files?.[n];
+    if (Array.isArray(arr) && arr[0]?.buffer) return arr[0];
+  }
+  return null;
 }
 
 // ---------- ROUTES ----------
@@ -261,10 +260,10 @@ app.post("/api/quiz/topic", async (req, res) => {
     const prompt = buildPrompt({ sourceText, topic, subject, profile, language, difficulty, count });
 
     const ai = await openai.responses.create({
-      model: "gpt-4o-mini", // rapid + suficient pentru quiz; poți schimba cu "gpt-4o" dacă vrei calitate mai mare
+      model: "gpt-4o-mini",
       input: prompt,
       temperature: 0.9,
-      max_output_tokens: 2000,
+      max_output_tokens: 2200,
     });
 
     const rawText = ai.output_text || "";
@@ -281,7 +280,7 @@ app.post("/api/quiz/topic", async (req, res) => {
       return res.status(500).json({ error: "Nu am putut extrage întrebări valide din output." });
     }
 
-    // 1) insert quiz (IMPORTANT: user_id obligatoriu)
+    // 1) insert quiz
     const quizPayload = {
       user_id: userId,
       source_type: "topic",
@@ -303,20 +302,15 @@ app.post("/api/quiz/topic", async (req, res) => {
     const qRows = questionsNorm.map((q) => ({
       quiz_id: quizId,
       idx: q.idx,
-      position: q.idx, // dacă ai și position în schemă, îl umplem
+      position: q.idx, // dacă nu există, îl scoatem la fallback
       question: q.question,
       options: q.options,
       answer_index: q.answer_index,
       explanation: q.explanation,
     }));
 
-    // inserare în bulk; dacă schema nu are unele coloane, scoatem automat
-    // (în practică, de obicei ai idx/quiz_id/question/options/answer_index/explanation)
     let { error: insErr } = await supabase.from("questions").insert(qRows);
     if (insErr) {
-      // fallback: dacă există coloane lipsă
-      // încercăm să prindem missing column și să reinserăm fără ea
-      // (simplu: reinserăm fără position dacă e problema)
       const msg = (insErr.message || "").toString();
       if (/Could not find the 'position' column/i.test(msg)) {
         const qRows2 = qRows.map(({ position, ...rest }) => rest);
@@ -327,7 +321,6 @@ app.post("/api/quiz/topic", async (req, res) => {
       }
     }
 
-    // Return pentru frontend
     return res.json({
       quiz_id: quizId,
       model_used: ai.model || "unknown",
@@ -341,239 +334,260 @@ app.post("/api/quiz/topic", async (req, res) => {
 /**
  * POST /api/quiz/pdf
  * multipart/form-data:
- * - pdf: file
+ * - pdf: file (acceptă și "file" ca fallback)
  * - user_id, subject, profile, topic, language, difficulty, count (strings)
+ *
+ * IMPORTANT: Fix pentru "MulterError: Unexpected field":
+ * - Acceptăm ambele: pdf și file
  */
-app.post("/api/quiz/pdf", upload.single("pdf"), async (req, res) => {
-  try {
-    const userId = safeUserId(req);
+app.post(
+  "/api/quiz/pdf",
+  upload.fields([
+    { name: "pdf", maxCount: 1 },
+    { name: "file", maxCount: 1 }, // fallback dacă frontend trimite "file"
+  ]),
+  async (req, res) => {
+    try {
+      const userId = safeUserId(req);
 
-    const subject = (req.body?.subject || "").toString();
-    const profile = (req.body?.profile || "").toString();
-    const topic = (req.body?.topic || req.body?.subject || "").toString();
-    const language = (req.body?.language || "Română").toString();
-    const difficulty = (req.body?.difficulty || "Mediu").toString();
-    const count = Number(req.body?.count || 10);
+      const subject = (req.body?.subject || "").toString();
+      const profile = (req.body?.profile || "").toString();
+      const topic = (req.body?.topic || req.body?.subject || "").toString();
+      const language = (req.body?.language || "Română").toString();
+      const difficulty = (req.body?.difficulty || "Mediu").toString();
+      const count = Number(req.body?.count || 10);
 
-    if (!req.file?.buffer) {
-      return res.status(400).json({ error: "Nu am primit PDF. (field name trebuie să fie 'pdf')" });
-    }
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY lipsește în ENV (Render)." });
-    }
+      const pdfFile = pickFirstFileFromFields(req, ["pdf", "file"]);
 
-    // extragem text din PDF
-    const pdfData = await pdfParse(req.file.buffer);
-    const extracted = (pdfData.text || "").trim();
-
-    if (!extracted || extracted.length < 50) {
-      return res.status(400).json({
-        error: "Nu am putut extrage suficient text din PDF. Încearcă alt PDF sau unul scanat nu merge fără OCR.",
-      });
-    }
-
-    // limităm materialul ca să nu fie enorm
-    const sourceText = extracted.slice(0, 18000);
-
-    const prompt = buildPrompt({ sourceText, topic, subject, profile, language, difficulty, count });
-
-    const ai = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      temperature: 0.9,
-      max_output_tokens: 2200,
-    });
-
-    const rawText = ai.output_text || "";
-    const parsed = tryParseJSON(rawText);
-    if (!parsed) {
-      return res.status(500).json({
-        error: `Unexpected token / output OpenAI nu e JSON valid.`,
-        raw: rawText.slice(0, 300),
-      });
-    }
-
-    const questionsNorm = normalizeQuestions(parsed);
-    if (questionsNorm.length === 0) {
-      return res.status(500).json({ error: "Nu am putut extrage întrebări valide din output." });
-    }
-
-    // 1) insert quiz (IMPORTANT: user_id obligatoriu)
-    const quizPayload = {
-      user_id: userId,
-      source_type: "pdf",
-      source_text: sourceText,
-      topic: topic || subject || "PDF",
-      subject: subject || null,
-      profile: profile || null,
-      language,
-      difficulty,
-      question_count: questionsNorm.length,
-    };
-
-    const { data: quizRow, error: quizErr } = await supabaseInsertSmart("quizzes", quizPayload);
-    if (quizErr) return res.status(500).json({ error: quizErr.message });
-
-    const quizId = quizRow.id;
-
-    // 2) insert questions
-    const qRows = questionsNorm.map((q) => ({
-      quiz_id: quizId,
-      idx: q.idx,
-      position: q.idx,
-      question: q.question,
-      options: q.options,
-      answer_index: q.answer_index,
-      explanation: q.explanation,
-    }));
-
-    let { error: insErr } = await supabase.from("questions").insert(qRows);
-    if (insErr) {
-      const msg = (insErr.message || "").toString();
-      if (/Could not find the 'position' column/i.test(msg)) {
-        const qRows2 = qRows.map(({ position, ...rest }) => rest);
-        const { error: insErr2 } = await supabase.from("questions").insert(qRows2);
-        if (insErr2) return res.status(500).json({ error: insErr2.message });
-      } else {
-        return res.status(500).json({ error: insErr.message });
+      if (!pdfFile?.buffer) {
+        return res.status(400).json({ error: "Nu am primit PDF. Trimite field 'pdf' (sau 'file')." });
       }
-    }
+      if (!OPENAI_API_KEY) {
+        return res.status(500).json({ error: "OPENAI_API_KEY lipsește în ENV (Render)." });
+      }
 
-    return res.json({
-      quiz_id: quizId,
-      model_used: ai.model || "unknown",
-      questions_count: questionsNorm.length,
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || "Server error" });
+      // extragem text din PDF
+      const pdfData = await pdfParse(pdfFile.buffer);
+      const extracted = (pdfData.text || "").trim();
+
+      if (!extracted || extracted.length < 50) {
+        return res.status(400).json({
+          error: "Nu am putut extrage suficient text din PDF. Dacă e scanat, fără OCR nu merge.",
+        });
+      }
+
+      const sourceText = extracted.slice(0, 18000);
+      const prompt = buildPrompt({ sourceText, topic, subject, profile, language, difficulty, count });
+
+      const ai = await openai.responses.create({
+        model: "gpt-4o-mini",
+        input: prompt,
+        temperature: 0.9,
+        max_output_tokens: 2400,
+      });
+
+      const rawText = ai.output_text || "";
+      const parsed = tryParseJSON(rawText);
+      if (!parsed) {
+        return res.status(500).json({
+          error: `Output OpenAI nu e JSON valid.`,
+          raw: rawText.slice(0, 300),
+        });
+      }
+
+      const questionsNorm = normalizeQuestions(parsed);
+      if (questionsNorm.length === 0) {
+        return res.status(500).json({ error: "Nu am putut extrage întrebări valide din output." });
+      }
+
+      // 1) insert quiz
+      const quizPayload = {
+        user_id: userId,
+        source_type: "pdf",
+        source_text: sourceText,
+        topic: topic || subject || "PDF",
+        subject: subject || null,
+        profile: profile || null,
+        language,
+        difficulty,
+        question_count: questionsNorm.length,
+      };
+
+      const { data: quizRow, error: quizErr } = await supabaseInsertSmart("quizzes", quizPayload);
+      if (quizErr) return res.status(500).json({ error: quizErr.message });
+
+      const quizId = quizRow.id;
+
+      // 2) insert questions
+      const qRows = questionsNorm.map((q) => ({
+        quiz_id: quizId,
+        idx: q.idx,
+        position: q.idx,
+        question: q.question,
+        options: q.options,
+        answer_index: q.answer_index,
+        explanation: q.explanation,
+      }));
+
+      let { error: insErr } = await supabase.from("questions").insert(qRows);
+      if (insErr) {
+        const msg = (insErr.message || "").toString();
+        if (/Could not find the 'position' column/i.test(msg)) {
+          const qRows2 = qRows.map(({ position, ...rest }) => rest);
+          const { error: insErr2 } = await supabase.from("questions").insert(qRows2);
+          if (insErr2) return res.status(500).json({ error: insErr2.message });
+        } else {
+          return res.status(500).json({ error: insErr.message });
+        }
+      }
+
+      return res.json({
+        quiz_id: quizId,
+        model_used: ai.model || "unknown",
+        questions_count: questionsNorm.length,
+      });
+    } catch (e) {
+      return res.status(500).json({ error: e?.message || "Server error" });
+    }
   }
-});
+);
 
 /**
  * POST /api/quiz/images
  * multipart/form-data:
- * - images: multiple files
+ * - images: multiple files (acceptă și "files" ca fallback)
  * - user_id, subject, profile, topic, language, difficulty, count
- *
- * Observație: dacă vrei calitate maximă pe imagini, trebuie “vision”.
- * Mai jos facem vision simplu cu OpenAI (input_image).
  */
-app.post("/api/quiz/images", upload.array("images", 10), async (req, res) => {
-  try {
-    const userId = safeUserId(req);
+app.post(
+  "/api/quiz/images",
+  upload.fields([
+    { name: "images", maxCount: 10 },
+    { name: "files", maxCount: 10 }, // fallback dacă frontend trimite "files"
+  ]),
+  async (req, res) => {
+    try {
+      const userId = safeUserId(req);
 
-    const subject = (req.body?.subject || "").toString();
-    const profile = (req.body?.profile || "").toString();
-    const topic = (req.body?.topic || req.body?.subject || "").toString();
-    const language = (req.body?.language || "Română").toString();
-    const difficulty = (req.body?.difficulty || "Mediu").toString();
-    const count = Number(req.body?.count || 10);
+      const subject = (req.body?.subject || "").toString();
+      const profile = (req.body?.profile || "").toString();
+      const topic = (req.body?.topic || req.body?.subject || "").toString();
+      const language = (req.body?.language || "Română").toString();
+      const difficulty = (req.body?.difficulty || "Mediu").toString();
+      const count = Number(req.body?.count || 10);
 
-    const files = req.files || [];
-    if (!files.length) {
-      return res.status(400).json({ error: "Nu am primit imagini. (field name trebuie să fie 'images')" });
-    }
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY lipsește în ENV (Render)." });
-    }
+      const files =
+        (Array.isArray(req.files?.images) && req.files.images) ||
+        (Array.isArray(req.files?.files) && req.files.files) ||
+        [];
 
-    // Construim input multimodal (vision) pentru a “citi” imaginile
-    const input = [
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: "Extrage ideile/definițiile din imaginile următoare și creează un quiz de calitate pe baza lor. Returnează STRICT JSON." },
-          ...files.map((f) => ({
-            type: "input_image",
-            image_url: `data:${f.mimetype};base64,${f.buffer.toString("base64")}`,
-          })),
-          {
-            type: "input_text",
-            text: buildPrompt({
-              sourceText: "Materialul este în imagini (note/poze).",
-              topic,
-              subject,
-              profile,
-              language,
-              difficulty,
-              count,
-            }),
-          },
-        ],
-      },
-    ];
-
-    const ai = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input,
-      temperature: 0.9,
-      max_output_tokens: 2200,
-    });
-
-    const rawText = ai.output_text || "";
-    const parsed = tryParseJSON(rawText);
-    if (!parsed) {
-      return res.status(500).json({
-        error: `Output OpenAI nu e JSON valid.`,
-        raw: rawText.slice(0, 300),
-      });
-    }
-
-    const questionsNorm = normalizeQuestions(parsed);
-    if (questionsNorm.length === 0) {
-      return res.status(500).json({ error: "Nu am putut extrage întrebări valide din output." });
-    }
-
-    // 1) insert quiz (IMPORTANT: user_id obligatoriu)
-    const quizPayload = {
-      user_id: userId,
-      source_type: "images",
-      source_text: "Material din imagini (vision).",
-      topic: topic || subject || "Images",
-      subject: subject || null,
-      profile: profile || null,
-      language,
-      difficulty,
-      question_count: questionsNorm.length,
-    };
-
-    const { data: quizRow, error: quizErr } = await supabaseInsertSmart("quizzes", quizPayload);
-    if (quizErr) return res.status(500).json({ error: quizErr.message });
-
-    const quizId = quizRow.id;
-
-    // 2) insert questions
-    const qRows = questionsNorm.map((q) => ({
-      quiz_id: quizId,
-      idx: q.idx,
-      position: q.idx,
-      question: q.question,
-      options: q.options,
-      answer_index: q.answer_index,
-      explanation: q.explanation,
-    }));
-
-    let { error: insErr } = await supabase.from("questions").insert(qRows);
-    if (insErr) {
-      const msg = (insErr.message || "").toString();
-      if (/Could not find the 'position' column/i.test(msg)) {
-        const qRows2 = qRows.map(({ position, ...rest }) => rest);
-        const { error: insErr2 } = await supabase.from("questions").insert(qRows2);
-        if (insErr2) return res.status(500).json({ error: insErr2.message });
-      } else {
-        return res.status(500).json({ error: insErr.message });
+      if (!files.length) {
+        return res.status(400).json({ error: "Nu am primit imagini. Trimite field 'images' (sau 'files')." });
       }
-    }
+      if (!OPENAI_API_KEY) {
+        return res.status(500).json({ error: "OPENAI_API_KEY lipsește în ENV (Render)." });
+      }
 
-    return res.json({
-      quiz_id: quizId,
-      model_used: ai.model || "unknown",
-      questions_count: questionsNorm.length,
-    });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || "Server error" });
+      const input = [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "Extrage ideile/definițiile din imaginile următoare și creează un quiz de calitate pe baza lor. Returnează STRICT JSON.",
+            },
+            ...files.map((f) => ({
+              type: "input_image",
+              image_url: `data:${f.mimetype};base64,${f.buffer.toString("base64")}`,
+            })),
+            {
+              type: "input_text",
+              text: buildPrompt({
+                sourceText: "Materialul este în imagini (note/poze).",
+                topic,
+                subject,
+                profile,
+                language,
+                difficulty,
+                count,
+              }),
+            },
+          ],
+        },
+      ];
+
+      const ai = await openai.responses.create({
+        model: "gpt-4o-mini",
+        input,
+        temperature: 0.9,
+        max_output_tokens: 2400,
+      });
+
+      const rawText = ai.output_text || "";
+      const parsed = tryParseJSON(rawText);
+      if (!parsed) {
+        return res.status(500).json({
+          error: `Output OpenAI nu e JSON valid.`,
+          raw: rawText.slice(0, 300),
+        });
+      }
+
+      const questionsNorm = normalizeQuestions(parsed);
+      if (questionsNorm.length === 0) {
+        return res.status(500).json({ error: "Nu am putut extrage întrebări valide din output." });
+      }
+
+      // 1) insert quiz
+      const quizPayload = {
+        user_id: userId,
+        source_type: "images",
+        source_text: "Material din imagini (vision).",
+        topic: topic || subject || "Images",
+        subject: subject || null,
+        profile: profile || null,
+        language,
+        difficulty,
+        question_count: questionsNorm.length,
+      };
+
+      const { data: quizRow, error: quizErr } = await supabaseInsertSmart("quizzes", quizPayload);
+      if (quizErr) return res.status(500).json({ error: quizErr.message });
+
+      const quizId = quizRow.id;
+
+      // 2) insert questions
+      const qRows = questionsNorm.map((q) => ({
+        quiz_id: quizId,
+        idx: q.idx,
+        position: q.idx,
+        question: q.question,
+        options: q.options,
+        answer_index: q.answer_index,
+        explanation: q.explanation,
+      }));
+
+      let { error: insErr } = await supabase.from("questions").insert(qRows);
+      if (insErr) {
+        const msg = (insErr.message || "").toString();
+        if (/Could not find the 'position' column/i.test(msg)) {
+          const qRows2 = qRows.map(({ position, ...rest }) => rest);
+          const { error: insErr2 } = await supabase.from("questions").insert(qRows2);
+          if (insErr2) return res.status(500).json({ error: insErr2.message });
+        } else {
+          return res.status(500).json({ error: insErr.message });
+        }
+      }
+
+      return res.json({
+        quiz_id: quizId,
+        model_used: ai.model || "unknown",
+        questions_count: questionsNorm.length,
+      });
+    } catch (e) {
+      return res.status(500).json({ error: e?.message || "Server error" });
+    }
   }
-});
+);
 
 // ---------- START ----------
 app.listen(PORT, () => {
